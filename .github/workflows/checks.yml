@@ -1,0 +1,67 @@
+name: checks
+
+on:
+  pull_request:
+  push:
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: '3.12'
+
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+
+      - name: GitHub workflow validation
+        # Verify the downloaded tool before executing it; review jobs never install it.
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/actionlint.tar.gz"
+          curl -fsSL https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz -o "$archive"
+          printf '%s  %s\n' 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8 "$archive" | sha256sum --check
+          tar -xzf "$archive" -C "$RUNNER_TEMP" actionlint
+          "$RUNNER_TEMP/actionlint" -color
+
+      - name: Host tests
+        # Standard-library helpers and local fixtures; no inference credentials.
+        run: uvx pytest host/tests
+
+      - name: Review runtime tests
+        run: node --test image/test-run-review.mjs
+
+      - name: Shell syntax
+        run: git ls-files '*.sh' | xargs -r -n1 bash -n
+
+      - name: CI YAML and embedded shell syntax
+        run: |
+          uv run --with pyyaml python - <<'PY'
+          import subprocess
+          from pathlib import Path
+          import yaml
+
+          for path in Path('.cscs/workflows').glob('*.yaml'):
+              data = yaml.safe_load(path.read_text())
+              for job in data.values():
+                  if not isinstance(job, dict):
+                      continue
+                  for key in ('before_script', 'script', 'after_script'):
+                      for script in job.get(key) or []:
+                          if isinstance(script, str):
+                              subprocess.run(['bash', '-n'], input=script, text=True, check=True)
+
+          for path in Path('.github/workflows').glob('*.yml'):
+              data = yaml.safe_load(path.read_text())
+              for job in data['jobs'].values():
+                  for step in job.get('steps', []):
+                      if 'run' in step:
+                          subprocess.run(['bash', '-n'], input=step['run'], text=True, check=True)
+          PY

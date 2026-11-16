@@ -1,0 +1,58 @@
+name: Generate consumer workflow
+
+on:
+  workflow_dispatch:
+    inputs:
+      allow-web:
+        description: Allow external web search and fetch tools in the consumer
+        default: false
+        type: boolean
+
+# Generation needs neither inference credentials nor permission to change repositories.
+permissions:
+  contents: read
+
+jobs:
+  generate:
+    # The generated pin must identify a commit published in the shared repository.
+    if: github.repository == 'eth-cscs/ai-code-review'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout selected release source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          # Resolve the branch/tag selected in Run workflow once, not again during generation.
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Generate pinned consumer workflow
+        env:
+          ALLOW_WEB: ${{ inputs.allow-web }}
+        run: |
+          set -euo pipefail
+          args=(--revision "$GITHUB_SHA")
+          if [[ "$ALLOW_WEB" == true ]]; then
+            args+=(--allow-web)
+          fi
+          python3 tools/caller.py "${args[@]}" > "$RUNNER_TEMP/cscs-review.yml"
+
+      - name: Retain consumer workflow
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: cscs-review-caller
+          path: ${{ runner.temp }}/cscs-review.yml
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Explain consumer installation
+        run: |
+          set -euo pipefail
+          {
+            printf '## Consumer workflow\n\nPinned shared revision: %s\n\n' "$GITHUB_SHA"
+            cat <<'MARKDOWN'
+          Download the **cscs-review-caller** artifact and install `cscs-review.yml` as `.github/workflows/cscs-review.yml` in the consumer.
+          Merge it into the consumer default branch and provide its `CSCS_INFERENCE_KEY` secret.
+          This file references the shared implementation; GitHub still needs the local file to receive comment events.
+          MARKDOWN
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,56 @@
+#!/usr/bin/env python3
+"""Print a consumer workflow with matching immutable workflow and helper revisions."""
+
+import argparse
+import re
+
+
+def workflow(revision, allow_web=False):
+    if not re.fullmatch(r"[0-9a-f]{40}", revision):
+        raise ValueError("revision must be a full lowercase commit SHA")
+    lines = [
+        "name: CSCS review",
+        "",
+        "on:",
+        "  # Conversation commands run the default branch's workflow, including for fork PRs.",
+        "  issue_comment:",
+        "    types: [created]",
+        "",
+        "permissions:",
+        "  contents: read",
+        "  pull-requests: write",
+        "",
+        "jobs:",
+        "  review:",
+        "    # Central authorization runs before per-PR cancellation or inference.",
+        f"    uses: eth-cscs/ai-code-review/.github/workflows/review.yml@{revision}",
+        "    with:",
+        "      # Keep this equal to the workflow pin; regenerate the caller when upgrading.",
+        f"      source-sha: '{revision}'",
+    ]
+    if allow_web:
+        lines.extend([
+            "      # Search and fetch queries may disclose repository details to external services.",
+            "      allow-web: true",
+        ])
+    lines.extend([
+        "    # Do not forward other repository or organization secrets.",
+        "    secrets:",
+        "      CSCS_INFERENCE_KEY: ${{ secrets.CSCS_INFERENCE_KEY }}",
+    ])
+    return "\n".join(lines) + "\n"
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--revision", required=True, help="published ai-code-review commit SHA")
+    parser.add_argument("--allow-web", action="store_true", help="enable external web search and fetch tools")
+    args = parser.parse_args()
+    try:
+        print(workflow(args.revision, args.allow_web), end="")
+    except ValueError as error:
+        parser.error(str(error))
+
+
+if __name__ == "__main__":
+    main()
