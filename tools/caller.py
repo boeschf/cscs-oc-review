@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Print a consumer workflow with matching immutable workflow and helper revisions."""
+"""Print a consumer workflow pinned to one immutable shared revision."""
 
 import argparse
 import re
@@ -24,12 +24,10 @@ def workflow(revision, allow_web=False):
         "  review:",
         "    # Central authorization runs before per-PR cancellation or inference.",
         f"    uses: eth-cscs/ai-code-review/.github/workflows/review.yml@{revision}",
-        "    with:",
-        "      # Keep this equal to the workflow pin; regenerate the caller when upgrading.",
-        f"      source-sha: '{revision}'",
     ]
     if allow_web:
         lines.extend([
+            "    with:",
             "      # Search and fetch queries may disclose repository details to external services.",
             "      allow-web: true",
         ])

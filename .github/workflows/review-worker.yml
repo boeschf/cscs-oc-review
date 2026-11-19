@@ -5,10 +5,6 @@ name: AI code review worker
 on:
   workflow_call:
     inputs:
-      source-sha:
-        description: Validated central helper and configuration commit
-        required: true
-        type: string
       allow-web:
         default: false
         type: boolean
@@ -61,22 +57,12 @@ jobs:
       pr_number: ${{ steps.prepare.outputs.pr_number }}
       head_sha: ${{ steps.prepare.outputs.head_sha }}
     steps:
-      - name: Require an immutable helper revision
-        env:
-          SOURCE_SHA: ${{ inputs.source-sha }}
-        run: |
-          set -euo pipefail
-          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] || {
-            echo 'source-sha must be a full lowercase commit SHA' >&2
-            exit 1
-          }
-
-      # Checkout defaults refer to the consumer, so name the central source explicitly.
+      # Load helpers from this worker's release commit, not the consumer's checkout.
       - name: Checkout trusted reviewer code and configuration
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          repository: eth-cscs/ai-code-review
-          ref: ${{ inputs.source-sha }}
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
           path: reviewer-source
           persist-credentials: false
 

@@ -48,7 +48,7 @@ The host checks `HEAD` and Git status before and after execution and attempts bo
 
 | Runner directory | Source | Treatment |
 | --- | --- | --- |
-| `reviewer-source/` | The supplied full commit SHA of `eth-cscs/ai-code-review` | Trusted executable helpers and shared configuration |
+| `reviewer-source/` | Current job's reusable-workflow repository and commit | Trusted executable helpers and shared configuration |
 | `repository-default/` | Consumer repository default branch | Trusted repository instructions only; no scripts executed |
 | `pr-source/` | API-selected current PR-head SHA | Untrusted source, mounted read-only |
 
@@ -56,12 +56,12 @@ The default branch selects trusted instructions; the PR's base branch is its mer
 The two branches may differ.
 Checkout and diff operations use validated commit SHAs, with Git hooks, external diff drivers, and text converters disabled.
 
-The entry workflow and helper source are both pinned to the same release commit by the generated consumer workflow.
+The consumer pins the entry workflow to one full release commit SHA.
+Both central-source checkouts use GitHub's `job.workflow_repository` and `job.workflow_sha`, which identify the workflow that defines the current job rather than the consumer's workflow.
 The worker is referenced relative to the entry workflow, so GitHub loads it at that entry's commit.
-The required `source-sha` input selects central helper/configuration code explicitly because the reusable workflow's `github` context belongs to the consumer.
-It must match the entry workflow pin; generate both together rather than maintain separate revision values manually.
-The workflow does not infer the central revision from `github.sha`, the consumer's default branch, or central `main`.
-A repository maintainer can deliberately change either pin, so those changes must be reviewed as executable-code changes.
+Helpers and configuration therefore come from the same release without a separate source revision input.
+These job context properties are available on GitHub.com, not GitHub Enterprise Server.
+Review changes to the consumer's workflow pin as executable-code changes.
 The image is independently pinned by digest in the worker.
 
 Root repository instructions are optional.
@@ -242,5 +242,6 @@ GitHub secret propagation and private-fork policy cannot be established by local
 - [Reusable workflow access, caller context, token permissions, and billing](https://docs.github.com/en/actions/reference/workflows-and-actions/reusing-workflow-configurations).
 - [Repository-scoped GITHUB_TOKEN](https://docs.github.com/en/actions/concepts/security/github_token).
 - [Explicit secrets and same-commit relative workflow references](https://docs.github.com/en/actions/how-tos/reuse-automations/reuse-workflows).
+- [Current-job workflow identity and reusable-workflow source checkout](https://docs.github.com/en/actions/reference/workflows-and-actions/contexts#job-context).
 - [Default-branch requirement for issue_comment](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#issue_comment).
 - [Repository and organization secret management](https://docs.github.com/en/actions/how-tos/write-workflows/choose-what-workflows-do/use-secrets).

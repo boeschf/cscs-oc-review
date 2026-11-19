@@ -3,10 +3,6 @@ name: CSCS review
 on:
   workflow_call:
     inputs:
-      source-sha:
-        description: Full commit SHA of this repository, matching the caller's workflow pin
-        required: true
-        type: string
       allow-web:
         description: Allow web search and fetch tools to send queries outside CSCS
         default: false
@@ -39,24 +35,13 @@ jobs:
       contents: read
     outputs:
       authorized: ${{ steps.access.outputs.authorized }}
-      source_sha: ${{ inputs.source-sha }}
     steps:
-      # A separate input avoids guessing the called workflow's revision from caller context.
-      - name: Require an immutable helper revision
-        env:
-          SOURCE_SHA: ${{ inputs.source-sha }}
-        run: |
-          set -euo pipefail
-          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] || {
-            echo 'source-sha must be a full lowercase commit SHA' >&2
-            exit 1
-          }
-
+      # The job context identifies this reusable workflow, not the consumer's workflow.
       - name: Checkout trusted authorization code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          repository: eth-cscs/ai-code-review
-          ref: ${{ inputs.source-sha }}
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
           path: reviewer-source
           persist-credentials: false
 
@@ -85,7 +70,6 @@ jobs:
     # A relative reference keeps this worker at the entry workflow's release commit.
     uses: ./.github/workflows/review-worker.yml
     with:
-      source-sha: ${{ needs.authorize.outputs.source_sha }}
       allow-web: ${{ inputs.allow-web }}
     secrets:
       CSCS_INFERENCE_KEY: ${{ secrets.CSCS_INFERENCE_KEY }}
