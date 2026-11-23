@@ -23,7 +23,7 @@ def workflow(revision, allow_web=False):
         "jobs:",
         "  review:",
         "    # Central authorization runs before per-PR cancellation or inference.",
-        f"    uses: eth-cscs/ai-code-review/.github/workflows/review.yml@{revision}",
+        f"    uses: eth-cscs/cscs-oc-review/.github/workflows/review.yml@{revision}",
     ]
     if allow_web:
         lines.extend([
@@ -41,7 +41,7 @@ def workflow(revision, allow_web=False):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--revision", required=True, help="published ai-code-review commit SHA")
+    parser.add_argument("--revision", required=True, help="published cscs-oc-review commit SHA")
     parser.add_argument("--allow-web", action="store_true", help="enable external web search and fetch tools")
     args = parser.parse_args()
     try:

@@ -6,7 +6,7 @@ stages: [build, report]
 variables:
   # Use a new versioned tag for runtime or reviewer-policy changes, not configuration.
   # Never overwrite a published version; report a digest pin for review-worker.yml.
-  OPENCODE_REVIEW_IMAGE: ghcr.io/eth-cscs/ai-code-review/opencode-review:opencode-2.2.0-amd64-v1
+  OPENCODE_REVIEW_IMAGE: ghcr.io/eth-cscs/cscs-oc-review/opencode-review:opencode-2.2.0-amd64-v1
   OPENCODE_REVIEW_BASE_IMAGE: docker.io/library/node:24-bookworm-slim
 
 build-opencode-review-image:

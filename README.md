@@ -1,8 +1,9 @@
-# AI code review
+# CSCS OpenCode review
 
 ## Purpose
 
 This repository provides an on-demand PR reviewer for repositories in the `eth-cscs` GitHub organization.
+The upstream source is [eth-cscs/cscs-oc-review](https://github.com/eth-cscs/cscs-oc-review).
 A shared workflow authorizes a Conversation comment, inspects the PR in a read-only container, and posts a separate final response.
 The [reviewer policy](image/grumpy-reviewer.md) defines the grumpy voice, evidence standards, coverage requirements, and response format.
 The reviewer does not implement changes, execute PR code or tests, install packages, or publish its own output.
@@ -11,6 +12,14 @@ Model findings still require human review.
 Each participating repository runs the shared workflows with its own GitHub Actions token and inference secret.
 No custom GitHub App, cross-repository write token, or consumer CSCS webhook integration is required.
 Runs, artifacts, comments, and GitHub-hosted runner charges belong to the participating repository, not this shared repository.
+
+### Scope
+
+The current scope is on-demand, advisory review on GitHub.com.
+Each subscriber repository adds one small caller workflow; the setup instructions below call it a consumer.
+Reviews are not required merge checks.
+Hosted services, GitHub Apps, CSCS-CI middleware changes, and GitLab support are outside the current scope.
+Subscriber repositories do not need CSCS-CI registration.
 
 ## Components and trust boundaries
 
@@ -71,7 +80,7 @@ Staging uses a new output file and does not overwrite consumer files.
 
 ## Consumer setup
 
-The shared repository must be public and available as `eth-cscs/ai-code-review`.
+The shared repository must be public and available as [eth-cscs/cscs-oc-review](https://github.com/eth-cscs/cscs-oc-review).
 Its reusable workflows must be allowed by the consumer's repository and organization Actions policies.
 Both public and private consumers can call a public shared workflow under GitHub's documented access rules.
 The consumer must permit the caller's requested `contents: read` and `pull-requests: write` permissions; the shared workflow cannot increase them.
@@ -198,6 +207,8 @@ Missing reasoning events do not establish that the model generated none.
 
 The worker currently uses an existing publicly published runtime by digest.
 Its registry namespace does not determine which consumer repository is reviewed.
+The upstream repository rename leaves that image pin unchanged.
+Future builds target `ghcr.io/eth-cscs/cscs-oc-review/opencode-review`; they affect review jobs only after the worker's digest pin is updated.
 [image/Containerfile](image/Containerfile) builds the equivalent standalone runtime without dependencies on another repository's package helpers.
 Only runtime files and policy are copied into the image, not tests, repository instructions, or runtime configuration.
 
@@ -224,7 +235,7 @@ Run from this repository root:
 uv run --python 3.12 --with pytest pytest -q host/tests
 node --test image/test-run-review.mjs
 bash -n image/entrypoint.sh
-podman build --format docker -f image/Containerfile -t localhost/ai-code-review .
+podman build --format docker -f image/Containerfile -t localhost/cscs-oc-review .
 ```
 
 The regression suites use temporary repositories and controlled child processes, not inference credentials.

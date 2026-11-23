@@ -15,7 +15,7 @@ permissions:
 jobs:
   generate:
     # The generated pin must identify a commit published in the shared repository.
-    if: github.repository == 'eth-cscs/ai-code-review'
+    if: github.repository == 'eth-cscs/cscs-oc-review'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
