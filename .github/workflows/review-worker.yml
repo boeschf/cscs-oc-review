@@ -50,9 +50,9 @@ jobs:
       contents: read
       pull-requests: read
     env:
-      # The existing public runtime can review any repository; source/configuration are separate mounts.
+      # Use this repository's public runtime; source/configuration are separate mounts.
       # Update only after a separately built image has passed anonymous-pull verification.
-      OPENCODE_REVIEW_IMAGE: ghcr.io/eth-cscs/alps-extended-images/opencode-review@sha256:93b2458f845fa71b2923c851620a89e153e5f6ac3274eb5eccc86ca6a349f62d
+      OPENCODE_REVIEW_IMAGE: ghcr.io/eth-cscs/cscs-oc-review/opencode-review@sha256:318fce7669bd3ade34f9ab3407c9a0e7ef046453ce3cb7e25a1d7b3d6a3a7954
     outputs:
       pr_number: ${{ steps.prepare.outputs.pr_number }}
       head_sha: ${{ steps.prepare.outputs.head_sha }}

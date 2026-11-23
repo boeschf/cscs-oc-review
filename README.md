@@ -205,10 +205,9 @@ Missing reasoning events do not establish that the model generated none.
 
 ## Image releases
 
-The worker currently uses an existing publicly published runtime by digest.
+The worker uses this repository's publicly published AMD64 runtime, pinned by digest.
 Its registry namespace does not determine which consumer repository is reviewed.
-The upstream repository rename leaves that image pin unchanged.
-Future builds target `ghcr.io/eth-cscs/cscs-oc-review/opencode-review`; they affect review jobs only after the worker's digest pin is updated.
+New builds target `ghcr.io/eth-cscs/cscs-oc-review/opencode-review`; review jobs use them only after the worker's digest pin is updated.
 [image/Containerfile](image/Containerfile) builds the equivalent standalone runtime without dependencies on another repository's package helpers.
 Only runtime files and policy are copied into the image, not tests, repository instructions, or runtime configuration.
 
