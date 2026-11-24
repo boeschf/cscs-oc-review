@@ -47,15 +47,15 @@ jobs:
             --output "$RUNNER_TEMP/release"
 
       - name: Validate the generated callers
-        # Lint both generated caller workflows before adding their YAML to the draft release notes.
+        # Lint both generated caller workflows before uploading them as release assets.
         # Source tests already passed in checks.yml for this exact commit and are not repeated here.
         run: |
           actionlint "$RUNNER_TEMP/release/cscs-review.yml" "$RUNNER_TEMP/release/cscs-review-web.yml"
 
-      - name: Create the draft release
-        # Recheck that the version is unused, reserve its tag at the captured SHA, and create a draft.
-        # Embed the validated caller files in the notes; publication remains a maintainer action.
-        # If draft creation fails after tag creation, leave the tag for manual inspection.
+      - name: Create the draft release and upload callers
+        # Recheck the version, reserve its tag at the captured SHA, and create a draft.
+        # Upload the validated files unchanged; publication remains a maintainer action.
+        # Failures leave the tag, draft, or partial uploads for manual inspection.
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -63,6 +63,6 @@ jobs:
           url="$(uv run --with pyyaml python tools/release.py create --output "$RUNNER_TEMP/release")"
           {
             printf '## Draft release\n\n[Review the draft](%s)\n\n' "$url"
-            printf 'Both validated caller variants are in the release notes. Review the change summary, then publish and mark the release as latest.\n'
+            printf 'Both validated callers are attached as release assets. Review the assets and change summary, then publish and mark the release as latest.\n'
             printf 'No release was published and no inference request was made by this workflow.\n'
           } >> "$GITHUB_STEP_SUMMARY"

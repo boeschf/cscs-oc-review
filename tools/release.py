@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Prepare release callers and create an unpublished GitHub release.
+"""Prepare release callers and attach them to an unpublished GitHub release.
 
 Run prepare from the trusted source checkout, lint both generated callers, then
 run create on the same output directory. API calls use GH_TOKEN; source CI is
-queried, not rerun. A tag is not rolled back if draft creation fails.
+queried, not rerun. Failed creation or upload leaves unpublished state for inspection.
 """
 
 import argparse
@@ -40,22 +40,32 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
 
 
 def github_api(path, payload=None):
-    """GET path or POST a JSON payload to api.github.com; return decoded JSON.
+    """GET JSON or POST a payload to GitHub; return the decoded JSON response.
 
+    JSON requests use api.github.com. Byte payloads are sent unchanged to the
+    release-asset endpoint on uploads.github.com as application/octet-stream.
     Callers supply a leading-slash API path. Require GH_TOKEN, reject redirects,
     and propagate HTTP, network, and JSON decoding errors.
     """
     token = os.environ.get("GH_TOKEN")
     if not token:
         raise ValueError("GH_TOKEN is required")
+    if isinstance(payload, bytes):
+        origin = "https://uploads.github.com"
+        data = payload
+        content_type = "application/octet-stream"
+    else:
+        origin = "https://api.github.com"
+        data = None if payload is None else json.dumps(payload).encode("utf-8")
+        content_type = "application/json"
     request = urllib.request.Request(
-        "https://api.github.com" + path,
+        origin + path,
         headers={"Authorization": "Bearer " + token,
                  "Accept": "application/vnd.github+json",
                  "X-GitHub-Api-Version": "2022-11-28",
                  "User-Agent": "cscs-oc-review-release",
-                 "Content-Type": "application/json"},
-        data=None if payload is None else json.dumps(payload).encode("utf-8"),
+                 "Content-Type": content_type},
+        data=data,
         method="GET" if payload is None else "POST",
     )
     with urllib.request.build_opener(NoRedirect()).open(request, timeout=60) as response:
@@ -156,61 +166,73 @@ def prepare(repository, revision, ref, output, api=github_api):
     return metadata
 
 
-def release_notes(metadata, standard, web, changes):
-    """Return release Markdown with both supplied caller texts embedded verbatim.
+def release_notes(metadata, changes):
+    """Return installation links, provenance, web disclosure, image pin, and changes.
 
-    Callers must lint the YAML first; this function does not validate or
-    regenerate it. Include source provenance, image pin, and generated changes.
+    Download links identify this release, not latest. Caller YAML is distributed
+    only as assets so there is no second copy to maintain in the notes.
     """
     repository, revision = metadata["repository"], metadata["revision"]
+    downloads = f"https://github.com/{repository}/releases/download/{metadata['tag']}"
+    standard, web = (f"{downloads}/{filename}" for filename in CALLER_FILES)
     return (
-        f"## Installation\n\n"
+        "## Installation\n\n"
         f"Source version: **{metadata['tag']}** · "
         f"[Commit `{revision}`](https://github.com/{repository}/commit/{revision}) · "
         f"[Successful checks]({metadata['checks_url']})\n\n"
-        "Choose **one** workflow below. Copy the complete block into "
-        "`.github/workflows/cscs-review.yml` in the subscriber repository and merge it into its default branch. "
-        "Provide the `CSCS_INFERENCE_KEY` Actions secret, then post `/cscs-review` on a PR. "
-        "The requester needs repository write access. Installed callers remain pinned until you update them.\n\n"
-        "### Standard installation — web tools disabled\n\n"
-        "Recommended default.\n\n```yaml\n" + standard + "```\n\n"
-        "### Optional installation — web tools enabled\n\n"
+        "Download **one** caller from this release:\n\n"
+        f"- [{CALLER_FILES[0]}]({standard}): web tools disabled; recommended default.\n"
+        f"- [{CALLER_FILES[1]}]({web}): web tools enabled; explicit opt-in.\n\n"
+        "Save either download as `.github/workflows/cscs-review.yml` in the subscriber repository "
+        "and merge it into its default branch.\n"
+        "Provide the `CSCS_INFERENCE_KEY` Actions secret, then post `/cscs-review` on a PR.\n"
+        "The requester needs repository write access.\n"
+        "Installed callers remain SHA-pinned until you update them.\n\n"
         "> [!WARNING]\n"
-        "> Web search queries and fetched URLs can disclose repository information outside CSCS. "
-        "Enable this variant only if your repository's data policy permits it. "
-        "Disabling web tools is not a firewall for the agent's shell.\n\n"
-        "```yaml\n" + web + "```\n\n"
+        "> Web search queries and fetched URLs can disclose repository information outside CSCS.\n"
+        "> Enable the web-enabled caller only if your repository's data policy permits it.\n"
+        "> Disabling web tools is not a firewall for the agent's shell.\n\n"
         "## Runtime image\n\n```text\n" + metadata["image"] + "\n```\n\n"
-        "The image is independently pinned by digest. This source release does not rebuild it.\n\n"
+        "The image is independently pinned by digest.\n"
+        "This source release does not rebuild it.\n\n"
         "## Changes\n\n" + changes + "\n"
     )
 
 
 def create_draft(output, api=github_api):
-    """Create a tag and draft from trusted prepare output; return the draft URL.
+    """Create a tag and draft, upload both callers, then return the draft URL.
 
-    Caller files must have passed actionlint; this function does not lint or
-    rerun source CI. Recheck version availability and generate the changelog,
-    then create the tag at the captured SHA before creating the draft.
-    Never publish or overwrite a version. Failures propagate without cleanup;
-    a tag can remain if the subsequent draft request fails.
+    Caller files must have passed actionlint; read their exact bytes without
+    regeneration. Recheck version availability and generate the changelog,
+    then reserve the captured SHA and upload assets to the new draft.
+    Never publish, overwrite, retry, or delete remote state. A failed upload
+    leaves an incomplete draft for inspection and does not return a success URL.
     """
     output = Path(output)
     metadata = json.loads((output / "metadata.json").read_text(encoding="utf-8"))
     repository, revision, tag = metadata["repository"], metadata["revision"], metadata["tag"]
     if repository != REPOSITORY or not SHA.fullmatch(revision) or tag != version_tag(metadata["version"]):
         raise ValueError("invalid prepared release metadata")
-    standard, web = ((output / filename).read_text(encoding="utf-8") for filename in CALLER_FILES)
+    assets = {filename: (output / filename).read_bytes() for filename in CALLER_FILES}
     require_unused_version(repository, tag, api)
     generated = api(f"/repos/{repository}/releases/generate-notes",
                     {"tag_name": tag, "target_commitish": revision})
-    notes = release_notes(metadata, standard, web, generated["body"])
+    notes = release_notes(metadata, generated["body"])
     (output / "release-notes.md").write_text(notes, encoding="utf-8")
-    # Reserve the exact tag target now, rather than leaving a draft's future tag mutable by default-branch movement.
+    # Reserve the exact tag target now, rather than following later default-branch movement.
     api(f"/repos/{repository}/git/refs", {"ref": "refs/tags/" + tag, "sha": revision})
     release = api(f"/repos/{repository}/releases",
                   {"tag_name": tag, "target_commitish": revision, "name": tag,
                    "body": notes, "draft": True, "prerelease": False})
+    release_id = release.get("id")
+    if type(release_id) is not int or release_id <= 0 or release.get("draft") is not True:
+        raise ValueError("GitHub did not return an identified draft release")
+    for filename, content in assets.items():
+        query = urllib.parse.urlencode({"name": filename})
+        asset = api(f"/repos/{repository}/releases/{release_id}/assets?{query}", content)
+        if (asset.get("state") != "uploaded" or asset.get("name") != filename
+                or asset.get("size") != len(content)):
+            raise ValueError(f"release asset {filename} was not uploaded completely")
     return release["html_url"]
 
 
@@ -223,7 +245,7 @@ def main(argv=None):
     check.add_argument("--revision", required=True)
     check.add_argument("--ref", required=True)
     check.add_argument("--output", required=True, type=Path)
-    create = commands.add_parser("create", help="create a draft after actionlint validates the caller files")
+    create = commands.add_parser("create", help="create a draft and upload both actionlint-validated callers")
     create.add_argument("--output", required=True, type=Path)
     args = parser.parse_args(argv)
     try:

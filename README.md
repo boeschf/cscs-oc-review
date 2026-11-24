@@ -24,12 +24,21 @@ No GitHub App, hosted receiver, PAT, registry credential, or CSCS-CI registratio
 
 ### Install the caller
 
-1. Open the [latest release](https://github.com/eth-cscs/cscs-oc-review/releases/latest) and review its changes and limitations.
-2. Choose one complete caller YAML block from the release notes: web tools disabled or enabled.
-3. Copy it to `.github/workflows/cscs-review.yml` in the consumer and merge it into the default branch.
-4. Configure the inference secret and optional project instructions described below, then [request a review](#request-and-result-behavior).
+1. Review the changes and limitations in the [latest release](https://github.com/eth-cscs/cscs-oc-review/releases/latest).
+2. Run this from the consumer repository root to download one caller as `.github/workflows/cscs-review.yml`.
+   This overwrites an existing caller at that path.
 
-Install only one variant.
+   ```bash
+   caller=cscs-review.yml # Use cscs-review-web.yml to enable web tools.
+   mkdir -p .github/workflows &&
+     curl --fail --location --silent --show-error \
+       "https://github.com/eth-cscs/cscs-oc-review/releases/latest/download/$caller" \
+       --output .github/workflows/cscs-review.yml
+   ```
+
+3. Review the downloaded file, preserve any custom inputs, and configure the inference secret and optional project instructions described below.
+4. Merge the caller into the default branch, then [request a review](#request-and-result-behavior).
+
 The caller must be on the default branch because GitHub dispatches `issue_comment` events from that branch; a caller in an unmerged PR will not run.
 It pins the shared workflow to a full commit SHA, records the release in a version comment, and forwards only `CSCS_INFERENCE_KEY`.
 Do not replace that explicit secret mapping with `secrets: inherit`.
@@ -83,8 +92,9 @@ Submodules and Git LFS objects are not fetched, and the workflow does not obtain
 
 ### Upgrades
 
-To upgrade, update the shared-workflow SHA and version comment in `.github/workflows/cscs-review.yml` from the new release's caller.
+To upgrade, download the selected caller from the new release and update the shared-workflow SHA and version comment in `.github/workflows/cscs-review.yml`, preserving optional inputs.
 Review and merge the change.
+The latest-release download URL selects a release; installed callers remain pinned to full SHAs and do not update automatically.
 
 ## Request and result behavior
 
@@ -271,13 +281,14 @@ Before the first major release, incompatible changes increment the minor version
    PR runs, fork runs, and runs for other branches or commits do not qualify.
 3. Run **Actions → Prepare release → Run workflow** on that branch.
    It reads `VERSION`, rejects existing tags/releases including drafts, generates both caller variants, and actionlints their YAML without rerunning source suites.
-4. The workflow generates change notes, reserves the version tag at the dispatch SHA, and creates a draft containing both caller blocks, source provenance, the checks link, and image pin.
-5. Review the notes, then publish the draft and mark it as latest.
+4. The workflow generates change notes, reserves the version tag at the dispatch SHA, creates a draft, and uploads the exact validated `cscs-review.yml` and `cscs-review-web.yml` files as release assets.
+   Notes link to version-specific downloads and include source provenance, the checks link, and image pin.
+5. Inspect the notes and verify both assets before manually publishing the draft and marking it as latest.
 
 Preparation uses repository-scoped `GITHUB_TOKEN` permissions `contents: write` and `actions: read`, without a PAT or inference key.
-It neither builds images nor commits generated files or uploads installation assets.
-If draft creation fails after tag reservation, inspect the result and deliberately remove only unpublished leftover state before retrying.
-Published immutable versions cannot be reused.
+A creation or upload failure can leave an incomplete draft, tag, or assets; there is no automatic retry or cleanup.
+Inspect the result and deliberately remove only unpublished leftover state before retrying; never publish an incomplete draft.
+Published immutable releases prevent adding or replacing assets, and their versions cannot be reused.
 
 ### Development checks
 

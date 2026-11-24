@@ -6,7 +6,6 @@ The API fixture supplies paginated responses and failures; no test mutates GitHu
 import copy
 import importlib.util
 from pathlib import Path
-import re
 import sys
 import urllib.error
 import urllib.parse
@@ -59,11 +58,22 @@ class GitHub:
         self.tag_error = http_error(404)
         self.repository = {"full_name": REPOSITORY, "default_branch": "main"}
         self.create_error = None
+        self.draft = {
+            "id": 123, "draft": True,
+            "html_url": "https://github.com/eth-cscs/cscs-oc-review/releases/123",
+        }
+        self.upload_errors = {}
+        self.upload_responses = {}
 
     @property
     def writes(self):
         """Return recorded POST requests, including requests that raised an error."""
         return [(path, payload) for path, payload in self.calls if payload is not None]
+
+    @property
+    def uploads(self):
+        """Return attempted binary uploads in request order."""
+        return [(path, payload) for path, payload in self.calls if isinstance(payload, bytes)]
 
     def __call__(self, path, payload=None):
         """Record and dispatch fixture API calls; validate workflow query parameters."""
@@ -93,7 +103,17 @@ class GitHub:
         if path == base + "/releases" and payload is not None:
             if self.create_error is not None:
                 raise self.create_error
-            return {"html_url": "https://github.com/eth-cscs/cscs-oc-review/releases/123"}
+            return copy.deepcopy(self.draft)
+        if path.startswith(base + f"/releases/{self.draft.get('id')}/assets?") and isinstance(payload, bytes):
+            query = urllib.parse.parse_qs(urllib.parse.urlsplit(path).query)
+            assert set(query) == {"name"}
+            filename, = query["name"]
+            assert filename in release.CALLER_FILES
+            if filename in self.upload_errors:
+                raise self.upload_errors[filename]
+            return copy.deepcopy(self.upload_responses.get(filename, {
+                "state": "uploaded", "name": filename, "size": len(payload),
+            }))
         pytest.fail(f"unexpected API request: {path}, {payload!r}")
 
 
@@ -273,10 +293,13 @@ def test_prepare_then_create_pins_draft_and_both_caller_variants(source, version
     assert metadata["tag"] == "v" + version
     assert metadata["revision"] == REVISION
     assert not api.writes
+    prepared = {filename: (output / filename).read_bytes() for filename in release.CALLER_FILES}
+    # Creation must use the already validated files, not regenerate from source.
+    (source / "VERSION").write_text("99.99.99\n", encoding="utf-8")
 
     url = release.create_draft(output, api)
     assert url == "https://github.com/eth-cscs/cscs-oc-review/releases/123"
-    generated, reserved, created = api.writes
+    generated, reserved, created, *uploaded = api.writes
     assert generated == (f"/repos/{REPOSITORY}/releases/generate-notes", {
         "tag_name": "v" + version, "target_commitish": REVISION,
     })
@@ -293,18 +316,33 @@ def test_prepare_then_create_pins_draft_and_both_caller_variants(source, version
     assert (output / "release-notes.md").read_text(encoding="utf-8") == notes
     assert IMAGE in notes
     assert metadata["checks_url"] in notes
+    assert metadata["tag"] in notes
+    assert f"https://github.com/{REPOSITORY}/commit/{REVISION}" in notes
+    assert ".github/workflows/cscs-review.yml" in notes
+    assert "CSCS_INFERENCE_KEY" in notes
     assert "Generated changes from merged pull requests." in notes
-    blocks = re.findall(r"```yaml\n(.*?)```", notes, flags=re.DOTALL)
-    assert len(blocks) == 2
-    for block, filename, allow_web in zip(blocks, release.CALLER_FILES, (False, True)):
-        assert block == (output / filename).read_text(encoding="utf-8")
-        caller = yaml.safe_load(block)
+    assert len(uploaded) == 2
+    callers = []
+    for upload, filename, allow_web in zip(uploaded, release.CALLER_FILES, (False, True)):
+        path, content = upload
+        assert path == f"/repos/{REPOSITORY}/releases/123/assets?name={filename}"
+        assert isinstance(content, bytes)
+        assert content == prepared[filename]
+        assert content == (output / filename).read_bytes()
+        assert f"https://github.com/{REPOSITORY}/releases/download/v{version}/{filename}" in notes
+        assert content.decode("utf-8") not in notes
+        caller = yaml.safe_load(content)
+        callers.append(caller)
         job = caller["jobs"]["review"]
         assert job["uses"] == f"{REPOSITORY}/.github/workflows/review.yml@{REVISION}"
         assert job.get("with", {}).get("allow-web", False) is allow_web
         assert job["secrets"] == {"CSCS_INFERENCE_KEY": "${{ secrets.CSCS_INFERENCE_KEY }}"}
         assert caller["permissions"] == {"contents": "read", "pull-requests": "write"}
-    assert "disclose repository information outside CSCS" in notes
+    assert "```yaml" not in notes
+    assert "/releases/latest/" not in notes
+    assert "with" not in callers[0]["jobs"]["review"]
+    assert callers[1]["jobs"]["review"].pop("with") == {"allow-web": True}
+    assert callers[0] == callers[1]
 
 
 def test_draft_appearing_after_preparation_prevents_creation(source):
@@ -334,3 +372,111 @@ def test_draft_creation_failure_after_tag_reservation_propagates_without_cleanup
     ]
     assert api.calls[-1] == api.writes[-1]
     assert (output / "release-notes.md").exists()
+
+
+@pytest.mark.parametrize("filename", release.CALLER_FILES)
+def test_missing_local_caller_prevents_all_remote_writes(source, filename):
+    api = GitHub()
+    output = source / "prepared"
+    release.prepare(REPOSITORY, REVISION, "refs/heads/main", output, api)
+    (output / filename).unlink()
+    api.calls.clear()
+
+    with pytest.raises(FileNotFoundError):
+        release.create_draft(output, api)
+
+    assert not api.calls
+    assert not (output / "release-notes.md").exists()
+
+
+@pytest.mark.parametrize("upload_index", [0, 1])
+@pytest.mark.parametrize("error", [http_error(503), urllib.error.URLError("upload disconnected")])
+def test_upload_failure_stops_without_return_retry_cleanup_or_publication(source, upload_index, error):
+    api = GitHub()
+    output = source / "prepared"
+    release.prepare(REPOSITORY, REVISION, "refs/heads/main", output, api)
+    api.upload_errors[release.CALLER_FILES[upload_index]] = error
+
+    with pytest.raises(type(error)) as caught:
+        release.create_draft(output, api)
+
+    assert caught.value is error
+    assert [path for path, _ in api.writes] == [
+        f"/repos/{REPOSITORY}/releases/generate-notes",
+        f"/repos/{REPOSITORY}/git/refs",
+        f"/repos/{REPOSITORY}/releases",
+        *(f"/repos/{REPOSITORY}/releases/123/assets?name={filename}"
+          for filename in release.CALLER_FILES[:upload_index + 1]),
+    ]
+    assert api.calls[-1] == api.uploads[-1]
+    assert api.writes[2][1]["draft"] is True
+    assert (output / "release-notes.md").exists()
+    for filename in release.CALLER_FILES:
+        assert (output / filename).is_file()
+
+
+@pytest.mark.parametrize("upload_index", [0, 1])
+@pytest.mark.parametrize("field,value", [
+    (None, None),
+    ("state", None), ("name", None), ("size", None),
+    ("state", "starter"), ("name", "wrong.yml"),
+    ("size", 0), ("size", 10**9), ("size", "123"),
+])
+def test_incomplete_or_mismatched_upload_metadata_stops_creation(source, upload_index, field, value):
+    api = GitHub()
+    output = source / "prepared"
+    release.prepare(REPOSITORY, REVISION, "refs/heads/main", output, api)
+    filename = release.CALLER_FILES[upload_index]
+    response = {"state": "uploaded", "name": filename, "size": (output / filename).stat().st_size}
+    if field is None:
+        response = {}
+    elif value is None:
+        response.pop(field)
+    else:
+        response[field] = value
+    api.upload_responses[filename] = response
+
+    with pytest.raises(ValueError, match="not uploaded completely"):
+        release.create_draft(output, api)
+
+    assert [path for path, _ in api.writes] == [
+        f"/repos/{REPOSITORY}/releases/generate-notes",
+        f"/repos/{REPOSITORY}/git/refs",
+        f"/repos/{REPOSITORY}/releases",
+        *(f"/repos/{REPOSITORY}/releases/123/assets?name={name}"
+          for name in release.CALLER_FILES[:upload_index + 1]),
+    ]
+    assert api.calls[-1] == api.uploads[-1]
+    assert api.writes[2][1]["draft"] is True
+
+
+@pytest.mark.parametrize("response", [
+    {"draft": True},
+    {"id": None, "draft": True},
+    {"id": 0, "draft": True},
+    {"id": -1, "draft": True},
+    {"id": True, "draft": True},
+    {"id": "123", "draft": True},
+    {"id": 123.0, "draft": True},
+    {"id": 123},
+    {"id": 123, "draft": False},
+    {"id": 123, "draft": "true"},
+    {"id": 123, "draft": None},
+])
+def test_unidentified_or_non_draft_response_is_rejected_before_uploads(source, response):
+    api = GitHub()
+    output = source / "prepared"
+    release.prepare(REPOSITORY, REVISION, "refs/heads/main", output, api)
+    api.draft = {**response, "html_url": "https://github.com/example/release"}
+
+    with pytest.raises(ValueError):
+        release.create_draft(output, api)
+
+    assert not api.uploads
+    assert [path for path, _ in api.writes] == [
+        f"/repos/{REPOSITORY}/releases/generate-notes",
+        f"/repos/{REPOSITORY}/git/refs",
+        f"/repos/{REPOSITORY}/releases",
+    ]
+    assert api.calls[-1] == api.writes[-1]
+    assert api.writes[-1][1]["draft"] is True
