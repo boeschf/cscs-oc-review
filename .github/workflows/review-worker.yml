@@ -1,7 +1,7 @@
-name: AI code review worker
+name: Internal review worker
 
-# Callers can invoke this worker directly, without review.yml.
-# The prepare step checks the command and requester access again before inference.
+# Internal implementation of review.yml; not a supported consumer entry point.
+# The prepare step validates the command and requester permission before inference.
 on:
   workflow_call:
     inputs:
@@ -21,12 +21,11 @@ on:
 # Deny token permissions by default; each job grants its required scopes.
 permissions: {}
 
-# Repeated action pins are anchored at their first use in this file.
-# Permissions, checkout settings, and other step inputs remain explicit.
+# YAML anchors share action pins, not permissions or step inputs.
 
 jobs:
   # Use a comment-write token without checking out source or receiving the inference key.
-  # The event filter is not command authorization; prepare checks that before inference.
+  # This job does not validate the command or requester permission.
   acknowledge:
     if: >-
       github.repository_owner == 'eth-cscs' &&
@@ -41,8 +40,8 @@ jobs:
       # Identify the token user whose failure reactions can be removed after a successful retry.
       reaction_user_id: ${{ steps.reaction.outputs.user_id }}
     steps:
-      # Mark receipt with eyes; this does not indicate that inference or publication succeeded.
-      - name: Acknowledge accepted review request
+      # review.yml authorizes the request before this job adds the receipt reaction.
+      - name: Acknowledge receipt of review request
         id: reaction
         uses: &github_script_action actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
         with:
@@ -94,8 +93,8 @@ jobs:
           submodules: false
           lfs: false
 
-      # Recheck access in case it changed after authorization, then resolve the current PR head.
-      # All history pages are fetched; API failures stop preparation rather than omit context.
+      # Recheck the requester's permission and fetch the current PR head SHA.
+      # Fetch all review-history pages; fail on API errors.
       - name: Prepare validated PR metadata and review history
         id: prepare
         env:
@@ -146,7 +145,7 @@ jobs:
             --output "$RUNNER_TEMP/opencode-review/trusted/AGENTS.md"
 
       # Web tools are opt-in because their queries can disclose private source details.
-      # This is a tool permission, not a network firewall for the container's shell.
+      # Disabling web tools does not restrict shell network access.
       # Write configuration under RUNNER_TEMP; leave the checked-out shared configuration unchanged.
       - name: Stage shared runtime configuration
         env:
@@ -201,7 +200,7 @@ jobs:
             --events "$RUNNER_TEMP/opencode-review/model-output/events.jsonl" \
             --output "$RUNNER_TEMP/opencode-review/model-output/review.md"
 
-      # Transfer extracted final text to finish; keep context and raw model events on this runner.
+      # Upload only review.md for the finish job.
       - name: Retain review text only
         uses: &upload_artifact_action actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -210,7 +209,7 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-      # Include step outcomes even when setup failed before run.py could create diagnostics.
+      # Record step outcomes even if run.py did not create diagnostics.
       # Never upload prepared context, raw events, or stderr.
       - name: Record sanitized diagnostic outcomes
         if: ${{ always() }}

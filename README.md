@@ -9,7 +9,7 @@ Findings require human review and are not required merge checks.
 
 ## Consumer setup
 
-A consumer is a repository that installs a small caller workflow referencing the shared implementation in [eth-cscs/cscs-oc-review](https://github.com/eth-cscs/cscs-oc-review).
+A consumer is a repository that installs a small caller workflow referencing the shared implementation in [.github/workflows/review.yml](.github/workflows/review.yml), the only supported consumer entry point.
 
 ### Requirements
 
@@ -115,7 +115,7 @@ Noncommands and missing collaborators are skipped, while other permission API fa
 
 ### Results and retries
 
-- An `eyes` reaction acknowledges an authorized request in the normal entry flow, not a completed review.
+- An `eyes` reaction confirms receipt after entry-workflow authorization.
 - The final review comment identifies the reviewed commit and links to the workflow run.
 - A `confused` reaction indicates acknowledgement, review, or publication failure.
   Select **Re-run failed jobs** in Actions or post another command to retry.
@@ -183,7 +183,7 @@ The provider maps returned reasoning through `compatibility.reasoningField`; mis
 | Location | Responsibility |
 | --- | --- |
 | [.github/workflows/review.yml](.github/workflows/review.yml) | Public entry point, authorization, and per-PR cancellation |
-| [.github/workflows/review-worker.yml](.github/workflows/review-worker.yml) | Acknowledgement, preparation, execution, artifacts, publication, and failure reactions |
+| [.github/workflows/review-worker.yml](.github/workflows/review-worker.yml) | Internal worker for receipt acknowledgement, preparation, execution, artifacts, publication, and failure reactions |
 | [host/context.py](host/context.py), [host/history.py](host/history.py) | Request validation, context collection, diff rendering, and instruction assembly |
 | [host/run.py](host/run.py) | Input snapshots, container lifecycle, deadlines, source-state checks, and diagnostics |
 | [host/extract.py](host/extract.py) | Phase/session validation and final-response extraction |
@@ -235,7 +235,7 @@ GitHub API endpoints are fixed to GitHub.com, so GitHub Enterprise Server is not
 Instruction assembly validates every selected source before creating an output outside the checkout.
 It preserves content, labels sections and source paths, logs paths rather than contents, and emits a duplicate resolved source only as review-specific guidance.
 Both phases read the same `/instructions/AGENTS.md` snapshot.
-Direct worker callers bypass the entry authorization job, so preparation rechecks the command and requester permission before inference.
+The worker validates the command and requester permission before inference.
 Keep cancellation in the entry workflow; reusing its concurrency group in a caller or worker can cancel the run itself.
 
 ### Generate a caller locally
