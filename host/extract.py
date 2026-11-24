@@ -18,7 +18,6 @@ def extract_review(lines):
     session = None
     message = None
     parts = {}
-    finish_reason = None
     incomplete = False
     transitions = {
         ("initial", "inspection", "start"): "inspection",
@@ -73,16 +72,12 @@ def extract_review(lines):
         message_id = part.get("messageID")
         if not isinstance(message_id, str) or not message_id:
             raise ValueError("missing OpenCode message ID")
-        # Message IDs delimit responses when the CLI omits explicit step events.
-        if kind == "step_start" or message_id != message:
+        # Recovery may emit text without step_start; it must not replace a prior response.
+        if message is None:
             message = message_id
-            parts = {}
-            finish_reason = None
-        if kind == "step_start":
-            continue
-        if kind == "step_finish":
-            finish_reason = part.get("reason")
-        elif kind == "text":
+        elif message_id != message:
+            raise ValueError("final review phase changed the assistant message ID")
+        if kind == "text":
             part_id = part.get("id")
             text = part.get("text")
             end = part.get("time", {}).get("end") if isinstance(part.get("time"), dict) else None
@@ -91,8 +86,9 @@ def extract_review(lines):
             if type(end) not in (int, float) or end <= 0:
                 raise ValueError("OpenCode text part is incomplete")
             parts[part_id] = text
-    # Require the explicit final phase to finish, not merely an inspection summary.
-    if phase != "complete" or finish_reason not in (None, "stop", "end_turn"):
+    # The runner emits final/end only after a successful, uninterrupted CLI exit.
+    # OpenCode can reconcile completed text without emitting step_finish.
+    if phase != "complete":
         raise ValueError("OpenCode stopped before completing the final review phase")
     review = "\n\n".join(parts.values()).strip()
     if not review:

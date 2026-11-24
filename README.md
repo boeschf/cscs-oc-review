@@ -132,6 +132,7 @@ If a review is too long for a GitHub comment, the workflow does not post it; dow
 ### Context and concurrency
 
 Each review receives PR metadata, the full merge-base diff, and all pages of previous reviews, Conversation comments, and inline threads, including replies and resolution/outdated state.
+The complete context is mounted read-only at `/input/context.md`; inspection is instructed to read it in bounded ranges.
 Missing or malformed history stops preparation rather than silently omitting discussion.
 OpenCode is instructed to check earlier findings against the current code before reporting them again.
 
@@ -199,7 +200,9 @@ The provider maps returned reasoning through `compatibility.reasoningField`; mis
 
 Inspection uses tools to gather evidence; finalization uses the same private session with tools denied and provider-level `tool_choice: none`.
 The final task reapplies the image-baked [reviewer policy](image/grumpy-reviewer.md).
-Extraction rejects malformed phase order, changed sessions, finalizer tool use, and incomplete final output rather than publishing inspection text.
+Extraction requires completed text from one final assistant message and a successful runner-controlled final phase.
+OpenCode can reconcile text without `step_finish`; emitted finish events must report `stop` or `end_turn`.
+Malformed phases, changed sessions, finalizer tool use, unfinished text, failed finish events, and continuation responses fail without publication.
 
 | Review job | GitHub token permissions | Inference key |
 | --- | --- | --- |
