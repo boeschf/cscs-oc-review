@@ -68,7 +68,7 @@ jobs:
     env:
       # Use this repository's public runtime; source/configuration are separate mounts.
       # Update only after a separately built image has passed anonymous-pull verification.
-      OPENCODE_REVIEW_IMAGE: ghcr.io/eth-cscs/cscs-oc-review/opencode-review@sha256:318fce7669bd3ade34f9ab3407c9a0e7ef046453ce3cb7e25a1d7b3d6a3a7954
+      OPENCODE_REVIEW_IMAGE: ghcr.io/eth-cscs/cscs-oc-review/opencode-review@sha256:be9277c537350ff0c3c4f0e25f2d11dc34352b7509efe2abd1565c40f1004960
     outputs:
       # Pass the API-validated PR number and reviewed SHA to finish, not model-supplied values.
       pr_number: ${{ steps.prepare.outputs.pr_number }}
