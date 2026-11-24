@@ -9,6 +9,7 @@ on:
         type: boolean
     secrets:
       CSCS_INFERENCE_KEY:
+        description: CSCS inference API key; passed only to the inference step
         required: true
 
 # Jobs reduce this ceiling; source inspection never receives a write-enabled token.

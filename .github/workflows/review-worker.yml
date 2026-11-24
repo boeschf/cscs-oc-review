@@ -1,20 +1,28 @@
 name: AI code review worker
 
-# The public entry workflow authorizes the request before calling this worker.
-# This file is also downloadable, not a separate authorization boundary; prepare rechecks access.
+# Callers can invoke this worker directly, without review.yml.
+# The prepare step checks the command and requester access again before inference.
 on:
   workflow_call:
     inputs:
       allow-web:
+        description: Allow web search and fetch tools to send queries outside CSCS
         default: false
         type: boolean
     secrets:
       CSCS_INFERENCE_KEY:
+        description: CSCS inference API key; passed only to the inference step
         required: true
 
+# Deny token permissions by default; each job grants its required scopes.
 permissions: {}
 
+# Repeated action pins are anchored at their first use in this file.
+# Permissions, checkout settings, and other step inputs remain explicit.
+
 jobs:
+  # Use a comment-write token without checking out source or receiving the inference key.
+  # The event filter is not command authorization; prepare checks that before inference.
   acknowledge:
     if: >-
       github.repository_owner == 'eth-cscs' &&
@@ -26,11 +34,13 @@ jobs:
     permissions:
       pull-requests: write
     outputs:
+      # Identify the token user whose failure reactions can be removed after a successful retry.
       reaction_user_id: ${{ steps.reaction.outputs.user_id }}
     steps:
+      # Mark receipt with eyes; this does not indicate that inference or publication succeeded.
       - name: Acknowledge accepted review request
         id: reaction
-        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        uses: &github_script_action actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
         with:
           github-token: ${{ github.token }}
           script: |
@@ -42,6 +52,8 @@ jobs:
             // Use the token's identity, not a hardcoded bot name, when clearing failure reactions.
             core.setOutput('user_id', reaction.user.id);
 
+  # Prepare context and run inference with a read-only GitHub token.
+  # Only the container execution step receives the inference secret.
   review:
     needs: acknowledge
     runs-on: ubuntu-latest
@@ -54,12 +66,13 @@ jobs:
       # Update only after a separately built image has passed anonymous-pull verification.
       OPENCODE_REVIEW_IMAGE: ghcr.io/eth-cscs/cscs-oc-review/opencode-review@sha256:318fce7669bd3ade34f9ab3407c9a0e7ef046453ce3cb7e25a1d7b3d6a3a7954
     outputs:
+      # Pass the API-validated PR number and reviewed SHA to finish, not model-supplied values.
       pr_number: ${{ steps.prepare.outputs.pr_number }}
       head_sha: ${{ steps.prepare.outputs.head_sha }}
     steps:
       # Load helpers from this worker's release commit, not the consumer's checkout.
       - name: Checkout trusted reviewer code and configuration
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        uses: &checkout_action actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           repository: ${{ job.workflow_repository }}
           ref: ${{ job.workflow_sha }}
@@ -68,7 +81,7 @@ jobs:
 
       # These files supply instructions only; no consumer scripts are executed on the host.
       - name: Checkout consumer default-branch instructions
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        uses: *checkout_action
         with:
           repository: ${{ github.repository }}
           ref: ${{ github.event.repository.default_branch }}
@@ -92,8 +105,9 @@ jobs:
             --output "$RUNNER_TEMP/opencode-review/input" \
             --github-output "$GITHUB_OUTPUT"
 
+      # Fetch full history for merge-base calculation; treat PR files as data, not executable helpers.
       - name: Checkout validated PR head as data
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        uses: *checkout_action
         with:
           repository: ${{ steps.prepare.outputs.head_repository }}
           ref: ${{ steps.prepare.outputs.head_sha }}
@@ -115,6 +129,8 @@ jobs:
             --checkout "$GITHUB_WORKSPACE/pr-source" \
             --output "$RUNNER_TEMP/opencode-review/input/context.md"
 
+      # Copy root AGENTS.md from the default branch; use an empty file when it is absent.
+      # The helper rejects invalid files and paths that escape the checkout.
       - name: Stage optional trusted repository instructions
         run: |
           set -euo pipefail
@@ -124,6 +140,7 @@ jobs:
 
       # Web tools are opt-in because their queries can disclose private source details.
       # This is a tool permission, not a network firewall for the container's shell.
+      # Write configuration under RUNNER_TEMP; leave the checked-out shared configuration unchanged.
       - name: Stage shared runtime configuration
         env:
           ALLOW_WEB: ${{ inputs.allow-web }}
@@ -147,6 +164,7 @@ jobs:
           shutil.copyfile(source / "limits.json", target / "limits.json")
           PY
 
+      # Pull the digest-pinned public runtime without registry credentials or an image build.
       - name: Pull trusted prebuilt review image
         run: docker pull "$OPENCODE_REVIEW_IMAGE"
 
@@ -176,8 +194,9 @@ jobs:
             --events "$RUNNER_TEMP/opencode-review/model-output/events.jsonl" \
             --output "$RUNNER_TEMP/opencode-review/model-output/review.md"
 
+      # Transfer extracted final text to finish; keep context and raw model events on this runner.
       - name: Retain review text only
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: &upload_artifact_action actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: opencode-review
           path: ${{ runner.temp }}/opencode-review/model-output/review.md
@@ -207,16 +226,18 @@ jobs:
           path.write_text(json.dumps(diagnostic, sort_keys=True) + "\n")
           PY
 
+      # Retain sanitized diagnostics after setup, inference, or extraction failure.
       - name: Retain sanitized review diagnostics
         if: ${{ always() }}
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: *upload_artifact_action
         with:
           name: opencode-review-diagnostics
           path: ${{ runner.temp }}/opencode-review/model-output/events.diagnostics.json
           if-no-files-found: error
           retention-days: 7
 
-  # This job has comment permissions but no source checkout, inference key, or model process.
+  # Publish text and update reactions with a comment-write token; no source checkout or inference key.
+  # Run after dependency failures, but not after cancellation or a skipped acknowledge job.
   finish:
     needs: [acknowledge, review]
     if: ${{ always() && !cancelled() && needs.acknowledge.result != 'skipped' }}
@@ -225,6 +246,7 @@ jobs:
     permissions:
       pull-requests: write
     steps:
+      # Download final text only when review succeeded; otherwise continue to failure reporting.
       - name: Download review text
         id: download
         if: needs.review.result == 'success'
@@ -233,10 +255,11 @@ jobs:
           name: opencode-review
           path: ${{ runner.temp }}/opencode-review/model-output
 
+      # Validate artifact text and trusted PR identity, then skip posting if the PR head has changed.
       - name: Publish only against the reviewed PR head
         id: publish
         if: needs.review.result == 'success'
-        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        uses: *github_script_action
         env:
           REVIEW_PR_NUMBER: ${{ needs.review.outputs.pr_number }}
           REVIEW_HEAD_SHA: ${{ needs.review.outputs.head_sha }}
@@ -274,10 +297,11 @@ jobs:
             await github.rest.issues.createComment({...context.repo, issue_number: pull_number, body});
 
       # Include download/publication failures as well as failed dependencies.
-      # A successful retry removes only this workflow identity's failure reactions.
+      # A successful retry removes only this token user's failure reactions on the request comment.
+      # Cancellation leaves existing reactions unchanged.
       - name: Update request failure reaction
         if: ${{ always() && !cancelled() }}
-        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        uses: *github_script_action
         env:
           JOB_RESULTS: ${{ toJSON(needs.*.result) }}
           STEP_RESULTS: ${{ toJSON(steps.*.outcome) }}
