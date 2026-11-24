@@ -9,6 +9,10 @@ on:
         description: Allow web search and fetch tools to send queries outside CSCS
         default: false
         type: boolean
+      review-instructions-path:
+        description: Default-branch instruction file; empty discovers optional .github/cscs-review.md
+        default: ''
+        type: string
     secrets:
       CSCS_INFERENCE_KEY:
         description: CSCS inference API key; passed only to the inference step
@@ -129,13 +133,16 @@ jobs:
             --checkout "$GITHUB_WORKSPACE/pr-source" \
             --output "$RUNNER_TEMP/opencode-review/input/context.md"
 
-      # Copy root AGENTS.md from the default branch; use an empty file when it is absent.
-      # The helper rejects invalid files and paths that escape the checkout.
-      - name: Stage optional trusted repository instructions
+      # Combine optional AGENTS.md with the discovered or explicitly selected review instructions.
+      # Read only the consumer default branch; validate all files before creating the staged bundle.
+      - name: Stage trusted project instructions
+        env:
+          REVIEW_INSTRUCTIONS_PATH: ${{ inputs.review-instructions-path }}
         run: |
           set -euo pipefail
           python3 reviewer-source/host/context.py instructions \
             --checkout "$GITHUB_WORKSPACE/repository-default" \
+            --review-instructions-path="$REVIEW_INSTRUCTIONS_PATH" \
             --output "$RUNNER_TEMP/opencode-review/trusted/AGENTS.md"
 
       # Web tools are opt-in because their queries can disclose private source details.

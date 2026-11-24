@@ -216,10 +216,10 @@ def run_review(engine, image, checkout, context, events, instructions, config_di
     checkout = worktree_root(checkout)
     context = Path(context).resolve(strict=True)
     events = Path(events).resolve()
-    # The workflow stages optional consumer default-branch instructions externally.
+    # The workflow stages the merged consumer default-branch instruction bundle externally.
     instructions = Path(instructions).resolve(strict=True)
     if not instructions.is_file():
-        raise ValueError("trusted AGENTS.md must be a file")
+        raise ValueError("trusted instruction bundle must be a file")
     if checkout in instructions.parents:
         raise ValueError("instructions must be outside the PR checkout")
     config_dir = Path(config_dir).resolve(strict=True)

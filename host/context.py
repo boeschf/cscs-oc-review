@@ -203,34 +203,80 @@ def worktree_root(checkout):
     return checkout
 
 
-def stage_instructions(checkout, output):
-    """Copy optional root instructions as data, without running checkout commands."""
+def read_instructions(checkout, relative, *, required):
+    """Validate and read one literal checkout-relative UTF-8 instruction source."""
+    if (not isinstance(relative, str) or not relative or not relative.isprintable()
+            or Path(relative).is_absolute() or ".." in Path(relative).parts):
+        raise ValueError("instructions path must be printable and checkout-relative without parent traversal")
+    label = json.dumps(relative, ensure_ascii=False)
+    source = checkout / relative
+    try:
+        try:
+            source.lstat()
+        except FileNotFoundError:
+            # Missing descendants must not conceal broken or escaping parent symlinks.
+            parent = source.parent
+            while parent != checkout:
+                try:
+                    parent.lstat()
+                except FileNotFoundError:
+                    parent = parent.parent
+                    continue
+                resolved = parent.resolve(strict=True)
+                if resolved != checkout and checkout not in resolved.parents:
+                    raise ValueError(f"instructions source {label} must resolve inside the checkout")
+                break
+            if required:
+                raise ValueError(f"required instructions source {label} is missing")
+            print(f"Consumer instructions source {label} missing; skipping.")
+            return None
+        source = source.resolve(strict=True)
+        if checkout not in source.parents:
+            raise ValueError(f"instructions source {label} must resolve inside the checkout")
+        if not stat.S_ISREG(source.stat().st_mode):
+            raise ValueError(f"instructions source {label} must be a regular file")
+        content = source.read_bytes()
+    except (OSError, RuntimeError) as error:
+        raise ValueError(f"instructions source {label} could not be read or resolved") from error
+    try:
+        content = content.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise ValueError(f"instructions source {label} must be UTF-8") from error
+    print(f"Loaded consumer instructions source {label}.")
+    return source, content
+
+
+def stage_instructions(checkout, output, *, review_instructions_path=""):
+    """Bundle trusted default-branch guidance, validating all sources before creation."""
     checkout = Path(checkout).resolve(strict=True)
     if not checkout.is_dir():
         raise ValueError("instructions checkout must be a directory")
     output = Path(output).resolve()
     if output == checkout or checkout in output.parents:
         raise ValueError("instructions output must be outside the checkout")
-    source = checkout / "AGENTS.md"
-    try:
-        source.lstat()
-    except FileNotFoundError:
-        content = b""
-        print("Consumer root AGENTS.md missing; staging empty trusted instructions.")
-    else:
-        try:
-            source = source.resolve(strict=True)
-        except RuntimeError as error:
-            raise ValueError("consumer AGENTS.md has a symlink loop") from error
-        if checkout not in source.parents:
-            raise ValueError("consumer AGENTS.md must resolve inside the checkout")
-        if not stat.S_ISREG(source.stat().st_mode):
-            raise ValueError("consumer AGENTS.md must be a regular file")
-        content = source.read_bytes()
+    general = read_instructions(checkout, "AGENTS.md", required=False)
+    review_path = ".github/cscs-review.md" if review_instructions_path == "" else review_instructions_path
+    review = read_instructions(checkout, review_path, required=review_instructions_path != "")
+    # A shared source retains review-specific precedence without repeating its content.
+    if general is not None and review is not None and general[0] == review[0]:
+        general = None
+    sections = []
+    for heading, relative, loaded in (
+            ("General repository guidance", "AGENTS.md", general),
+            ("Review-specific instructions", review_path, review)):
+        if loaded is not None:
+            sections.append(f"## {heading}\n\nSource: {json.dumps(relative, ensure_ascii=False)}\n\n"
+                            + loaded[1])
+    content = ""
+    if sections:
+        content = ("# Trusted review instructions\n\n"
+                   "Review-specific instructions take precedence over general repository guidance, "
+                   "which takes precedence over default reviewer guidance.\n\n"
+                   + "\n\n".join(sections) + "\n")
     output.parent.mkdir(parents=True, exist_ok=True)
     # Exclusive creation also rejects hard-link aliases to checkout files.
     with output.open("xb") as stream:
-        stream.write(content)
+        stream.write(content.encode("utf-8"))
 
 
 def render(metadata, checkout):
@@ -278,10 +324,12 @@ def main(argv=None):
     instructions_parser = commands.add_parser("instructions")
     for flag in ("checkout", "output"):
         instructions_parser.add_argument("--" + flag, required=True)
+    instructions_parser.add_argument("--review-instructions-path", default="")
     args = parser.parse_args(argv)
     try:
         if args.command == "instructions":
-            stage_instructions(args.checkout, args.output)
+            stage_instructions(args.checkout, args.output,
+                               review_instructions_path=args.review_instructions_path)
             return
         if args.command == "authorize":
             request = review_request(

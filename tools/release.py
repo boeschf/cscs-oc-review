@@ -150,7 +150,8 @@ def prepare(repository, revision, ref, output, api=github_api):
     output = Path(output)
     output.mkdir(parents=True, exist_ok=False)
     for filename, allow_web in zip(CALLER_FILES, (False, True)):
-        (output / filename).write_text(workflow(revision, allow_web, version), encoding="utf-8")
+        (output / filename).write_text(
+            workflow(revision, allow_web=allow_web, release_version=version), encoding="utf-8")
     (output / "metadata.json").write_text(json.dumps(metadata) + "\n", encoding="utf-8")
     return metadata
 

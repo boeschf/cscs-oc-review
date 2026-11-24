@@ -7,6 +7,10 @@ on:
         description: Allow web search and fetch tools to send queries outside CSCS
         default: false
         type: boolean
+      review-instructions-path:
+        description: Default-branch instruction file; empty discovers optional .github/cscs-review.md
+        default: ''
+        type: string
     secrets:
       CSCS_INFERENCE_KEY:
         description: CSCS inference API key; passed only to the inference step
@@ -72,5 +76,6 @@ jobs:
     uses: ./.github/workflows/review-worker.yml
     with:
       allow-web: ${{ inputs.allow-web }}
+      review-instructions-path: ${{ inputs.review-instructions-path }}
     secrets:
       CSCS_INFERENCE_KEY: ${{ secrets.CSCS_INFERENCE_KEY }}

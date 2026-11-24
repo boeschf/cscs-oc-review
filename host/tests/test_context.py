@@ -508,42 +508,125 @@ def test_cli_noncommands_skip_without_permission_lookup(tmp_path, monkeypatch, b
     assert output.read_text() == "authorized=false\n"
 
 
-def test_cli_instructions_missing_stages_empty_file(tmp_path, capsys):
+@pytest.fixture
+def instruction_paths(tmp_path):
     checkout = tmp_path / "repository-default"
     checkout.mkdir()
-    output = tmp_path / "trusted" / "AGENTS.md"
-    context.main(["instructions", "--checkout", str(checkout), "--output", str(output)])
+    return checkout, tmp_path / "trusted" / "AGENTS.md"
+
+
+@pytest.mark.parametrize("options", [[], ["--review-instructions-path", ""]])
+def test_cli_instructions_missing_stages_empty_file(instruction_paths, capsys, options):
+    checkout, output = instruction_paths
+    context.main(["instructions", "--checkout", str(checkout), "--output", str(output), *options])
     assert output.read_bytes() == b""
-    assert "AGENTS.md missing" in capsys.readouterr().out
-    assert not (checkout / "AGENTS.md").exists()
+    logs = capsys.readouterr().out
+    for relative in ("AGENTS.md", ".github/cscs-review.md"):
+        assert f'{json.dumps(relative)} missing' in logs
+        assert not (checkout / relative).exists()
 
 
+@pytest.mark.parametrize("general,review", [(True, False), (False, True), (True, True)])
+def test_cli_instructions_bundles_available_default_sources(instruction_paths, general, review):
+    checkout, output = instruction_paths
+    if general:
+        (checkout / "AGENTS.md").write_text("General consumer guidance.\n", encoding="utf-8")
+    if review:
+        (checkout / ".github").mkdir()
+        (checkout / ".github/cscs-review.md").write_text("Review consumer guidance.", encoding="utf-8")
+    context.main(["instructions", "--checkout", str(checkout), "--output", str(output)])
+    bundle = output.read_text(encoding="utf-8")
+    assert ("## General repository guidance" in bundle) == general
+    assert ('Source: "AGENTS.md"' in bundle) == general
+    assert ("General consumer guidance.\n" in bundle) == general
+    assert ("## Review-specific instructions" in bundle) == review
+    assert ('Source: ".github/cscs-review.md"' in bundle) == review
+    assert ("Review consumer guidance." in bundle) == review
+
+
+def test_cli_instructions_override_replaces_default_not_general(instruction_paths, capsys):
+    checkout, output = instruction_paths
+    relative = 'docs/review "literal" $(not-a-command).md'
+    selected = checkout / relative
+    selected.parent.mkdir()
+    selected.write_text("Selected review guidance.\n", encoding="utf-8")
+    (checkout / "AGENTS.md").write_text("Independent general guidance.\n", encoding="utf-8")
+    (checkout / ".github").mkdir()
+    # An unselected default must not even be validated.
+    (checkout / ".github/cscs-review.md").write_bytes(b"\xff")
+    context.main(["instructions", "--checkout", str(checkout), "--output", str(output),
+                  "--review-instructions-path", relative])
+    bundle = output.read_text(encoding="utf-8")
+    assert "Independent general guidance.\n" in bundle
+    assert "Selected review guidance.\n" in bundle
+    assert f"Source: {json.dumps(relative)}" in bundle
+    assert ".github/cscs-review.md" not in bundle
+    assert ".github/cscs-review.md" not in capsys.readouterr().out
+
+
+def test_cli_instructions_missing_override_does_not_fall_back(instruction_paths, capsys):
+    checkout, output = instruction_paths
+    (checkout / "AGENTS.md").write_text("General guidance.\n")
+    (checkout / ".github").mkdir()
+    (checkout / ".github/cscs-review.md").write_text("Default review guidance.\n")
+    with pytest.raises(SystemExit) as error:
+        context.main(["instructions", "--checkout", str(checkout), "--output", str(output),
+                      "--review-instructions-path", "missing.md"])
+    assert error.value.code == 1
+    assert 'required instructions source "missing.md" is missing' in capsys.readouterr().err
+    assert not output.parent.exists()
+
+
+@pytest.mark.parametrize("relative", ["AGENTS.md", ".github/cscs-review.md"])
 @pytest.mark.parametrize("symlink", [False, True])
-def test_cli_instructions_copies_regular_file_or_in_tree_symlink_as_data(tmp_path, symlink):
-    checkout = tmp_path / "repository-default"
-    checkout.mkdir()
+def test_cli_instructions_preserves_utf8_sources_as_inert_data(
+        instruction_paths, tmp_path, capsys, relative, symlink):
+    checkout, output = instruction_paths
     marker = tmp_path / "executed"
-    content = f"$(touch {marker})\r\nConsumer instructions\n".encode()
-    instructions = checkout / "AGENTS.md"
+    content = f"$(touch {marker})\r\n${{SECRETS}} {{{{ github.token }}}}\r\nConsumer café\n".encode()
+    instructions = checkout / relative
+    instructions.parent.mkdir(parents=True, exist_ok=True)
     if symlink:
         nested = checkout / "docs"
         nested.mkdir()
         (nested / "instructions").write_bytes(content)
-        instructions.symlink_to("docs/instructions")
+        instructions.symlink_to(checkout / "docs/instructions")
     else:
         instructions.write_bytes(content)
-    output = tmp_path / "trusted" / "AGENTS.md"
     context.main(["instructions", "--checkout", str(checkout), "--output", str(output)])
-    assert output.read_bytes() == content
+    assert content in output.read_bytes()
     assert instructions.read_bytes() == content
+    logs = capsys.readouterr().out
+    assert f"Loaded consumer instructions source {json.dumps(relative)}." in logs
+    assert "touch" not in logs and "SECRETS" not in logs and "café" not in logs
     assert not marker.exists()
 
 
-@pytest.mark.parametrize("kind", ["broken", "outside", "directory", "loop", "fifo"])
-def test_cli_instructions_rejects_invalid_sources(tmp_path, kind):
-    checkout = tmp_path / "repository-default"
-    checkout.mkdir()
-    instructions = checkout / "AGENTS.md"
+@pytest.mark.parametrize("override", [False, True])
+def test_cli_instructions_same_resolved_file_is_review_specific_once(instruction_paths, override):
+    checkout, output = instruction_paths
+    content = "Shared consumer instructions.\n"
+    (checkout / "AGENTS.md").write_text(content)
+    options = ["--review-instructions-path", "AGENTS.md"] if override else []
+    if not override:
+        (checkout / ".github").mkdir()
+        (checkout / ".github/cscs-review.md").symlink_to("../AGENTS.md")
+    context.main(["instructions", "--checkout", str(checkout), "--output", str(output), *options])
+    bundle = output.read_text(encoding="utf-8")
+    assert bundle.count(content) == 1
+    assert "## Review-specific instructions" in bundle
+    assert "## General repository guidance" not in bundle
+
+
+@pytest.mark.parametrize("relative", ["AGENTS.md", ".github/cscs-review.md"])
+@pytest.mark.parametrize("kind", ["broken", "outside", "directory", "loop", "fifo", "utf8"])
+def test_cli_instructions_rejects_invalid_sources(instruction_paths, tmp_path, relative, kind, capsys):
+    checkout, output = instruction_paths
+    instructions = checkout / relative
+    instructions.parent.mkdir(parents=True, exist_ok=True)
+    other = checkout / (".github/cscs-review.md" if relative == "AGENTS.md" else "AGENTS.md")
+    other.parent.mkdir(parents=True, exist_ok=True)
+    other.write_text("Valid independent guidance.\n")
     if kind == "broken":
         instructions.symlink_to("missing")
     elif kind == "outside":
@@ -553,22 +636,48 @@ def test_cli_instructions_rejects_invalid_sources(tmp_path, kind):
     elif kind == "directory":
         instructions.mkdir()
     elif kind == "loop":
-        instructions.symlink_to("AGENTS.md")
-    else:
+        instructions.symlink_to(instructions.name)
+    elif kind == "fifo":
         os.mkfifo(instructions)
-    output = tmp_path / "staged"
+    else:
+        instructions.write_bytes(b"private-invalid-content\xff")
     with pytest.raises(SystemExit) as error:
         context.main(["instructions", "--checkout", str(checkout), "--output", str(output)])
     assert error.value.code == 1
-    assert not output.exists()
+    assert not output.parent.exists()
+    logs = capsys.readouterr()
+    assert relative in logs.err
+    assert "private-invalid-content" not in logs.out + logs.err
 
 
-def test_cli_instructions_unreadable_file_is_not_treated_as_missing(tmp_path, monkeypatch):
-    checkout = tmp_path / "repository-default"
-    checkout.mkdir()
-    instructions = checkout / "AGENTS.md"
+@pytest.mark.parametrize("kind", ["broken", "outside", "loop", "file"])
+def test_cli_instructions_missing_descendant_does_not_hide_invalid_parent(
+        instruction_paths, tmp_path, kind):
+    checkout, output = instruction_paths
+    parent = checkout / ".github"
+    if kind == "broken":
+        parent.symlink_to("missing")
+    elif kind == "outside":
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        parent.symlink_to(outside)
+    elif kind == "loop":
+        parent.symlink_to(".github")
+    else:
+        parent.write_text("not a directory")
+    with pytest.raises(SystemExit) as error:
+        context.main(["instructions", "--checkout", str(checkout), "--output", str(output)])
+    assert error.value.code == 1
+    assert not output.parent.exists()
+
+
+@pytest.mark.parametrize("relative", ["AGENTS.md", ".github/cscs-review.md"])
+def test_cli_instructions_unreadable_file_is_not_treated_as_missing(
+        instruction_paths, monkeypatch, relative):
+    checkout, output = instruction_paths
+    instructions = checkout / relative
+    instructions.parent.mkdir(parents=True, exist_ok=True)
     instructions.write_text("must not silently disappear\n")
-    output = tmp_path / "staged"
     original = Path.read_bytes
 
     def read_bytes(path):
@@ -581,37 +690,61 @@ def test_cli_instructions_unreadable_file_is_not_treated_as_missing(tmp_path, mo
     with pytest.raises(SystemExit) as error:
         context.main(["instructions", "--checkout", str(checkout), "--output", str(output)])
     assert error.value.code == 1
-    assert not output.exists()
+    assert not output.parent.exists()
 
 
-@pytest.mark.parametrize("kind", ["checkout", "input", "inside", "symlink", "hardlink"])
-def test_cli_instructions_output_cannot_overwrite_checkout_or_input(tmp_path, kind):
-    checkout = tmp_path / "repository-default"
-    checkout.mkdir()
-    instructions = checkout / "AGENTS.md"
-    instructions.write_text("preserve consumer instructions\n")
+@pytest.mark.parametrize("relative", [
+    "/absolute.md", "../outside.md", "docs/../../outside.md",
+    "bad\nname.md", "bad\tname.md", "bad\x00name.md", "bad\x7fname.md",
+])
+def test_cli_instructions_rejects_malformed_override_paths(instruction_paths, relative):
+    checkout, output = instruction_paths
+    with pytest.raises(SystemExit) as error:
+        context.main(["instructions", "--checkout", str(checkout), "--output", str(output),
+                      "--review-instructions-path", relative])
+    assert error.value.code == 1
+    assert not output.parent.exists()
+
+
+@pytest.mark.parametrize("kind", [
+    "checkout", "inside", "existing", "input-general", "input-review",
+    "symlink-general", "symlink-review", "hardlink-general", "hardlink-review",
+])
+def test_cli_instructions_output_cannot_overwrite_checkout_or_inputs(
+        instruction_paths, tmp_path, kind):
+    checkout, _ = instruction_paths
+    general = checkout / "AGENTS.md"
+    general.write_text("preserve general instructions\n")
+    review = checkout / ".github/cscs-review.md"
+    review.parent.mkdir()
+    review.write_text("preserve review instructions\n")
+    instructions = review if kind.endswith("review") else general
     if kind == "checkout":
         output = checkout
-    elif kind == "input":
-        output = instructions
     elif kind == "inside":
         output = checkout / "staged.md"
+    elif kind.startswith("input"):
+        output = instructions
     else:
         output = tmp_path / "looks-external"
-        if kind == "symlink":
+        if kind.startswith("symlink"):
             output.symlink_to(instructions)
-        else:
+        elif kind.startswith("hardlink"):
             os.link(instructions, output)
+        else:
+            output.write_text("preserve existing output\n")
     with pytest.raises(SystemExit) as error:
         context.main(["instructions", "--checkout", str(checkout), "--output", str(output)])
     assert error.value.code == 1
-    assert instructions.read_text() == "preserve consumer instructions\n"
+    assert general.read_text() == "preserve general instructions\n"
+    assert review.read_text() == "preserve review instructions\n"
+    if kind == "existing":
+        assert output.read_text() == "preserve existing output\n"
     assert not (checkout / "staged.md").exists()
 
 
-def test_cli_instructions_missing_source_still_rejects_output_inside_checkout(tmp_path):
-    checkout = tmp_path / "repository-default"
-    checkout.mkdir()
+def test_cli_instructions_missing_source_still_rejects_output_inside_checkout(instruction_paths):
+    checkout, _ = instruction_paths
     output = checkout / "AGENTS.md"
     with pytest.raises(SystemExit) as error:
         context.main(["instructions", "--checkout", str(checkout), "--output", str(output)])
