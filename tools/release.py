@@ -8,19 +8,19 @@ queried, not rerun. Failed creation or upload leaves unpublished state for inspe
 
 import argparse
 import json
-import os
 from pathlib import Path
 import re
 import urllib.error
 import urllib.parse
-import urllib.request
 
 import yaml
 
 if __package__:
     from .caller import version_tag, workflow
+    from .github import github_api
 else:
     from caller import version_tag, workflow
+    from github import github_api
 
 
 # Release preparation and creation accept only this upstream repository.
@@ -30,46 +30,6 @@ CHECKS_WORKFLOW = ".github/workflows/checks.yml"
 CALLER_FILES = ("cscs-review.yml", "cscs-review-web.yml")
 SHA = re.compile(r"[0-9a-f]{40}\Z", re.ASCII)
 IMAGE = re.compile(r"ghcr\.io/[a-z0-9][a-z0-9._/-]*@sha256:[0-9a-f]{64}\Z", re.ASCII)
-
-
-class NoRedirect(urllib.request.HTTPRedirectHandler):
-    """Reject redirects so authenticated API requests stay on the configured host."""
-
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        raise ValueError("GitHub API redirects are not allowed")
-
-
-def github_api(path, payload=None):
-    """GET JSON or POST a payload to GitHub; return the decoded JSON response.
-
-    JSON requests use api.github.com. Byte payloads are sent unchanged to the
-    release-asset endpoint on uploads.github.com as application/octet-stream.
-    Callers supply a leading-slash API path. Require GH_TOKEN, reject redirects,
-    and propagate HTTP, network, and JSON decoding errors.
-    """
-    token = os.environ.get("GH_TOKEN")
-    if not token:
-        raise ValueError("GH_TOKEN is required")
-    if isinstance(payload, bytes):
-        origin = "https://uploads.github.com"
-        data = payload
-        content_type = "application/octet-stream"
-    else:
-        origin = "https://api.github.com"
-        data = None if payload is None else json.dumps(payload).encode("utf-8")
-        content_type = "application/json"
-    request = urllib.request.Request(
-        origin + path,
-        headers={"Authorization": "Bearer " + token,
-                 "Accept": "application/vnd.github+json",
-                 "X-GitHub-Api-Version": "2022-11-28",
-                 "User-Agent": "cscs-oc-review-release",
-                 "Content-Type": content_type},
-        data=data,
-        method="GET" if payload is None else "POST",
-    )
-    with urllib.request.build_opener(NoRedirect()).open(request, timeout=60) as response:
-        return json.load(response)
 
 
 def require_unused_version(repository, tag, api=github_api):

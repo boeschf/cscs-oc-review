@@ -1,29 +1,26 @@
-"""Exercise authenticated urllib requests over loopback without external traffic."""
+"""Exercise API authentication and public asset redirects over loopback only."""
 
 import http.client
 import http.server
-import importlib.util
 import json
-from pathlib import Path
 import socket
-import sys
 import threading
 import urllib.request
 
 import pytest
 
+from tools import github, post_release
 
-TOOLS = Path(__file__).resolve().parents[1]
-spec = importlib.util.spec_from_file_location(
-    "cscs_release_http_tests", TOOLS / "release.py", submodule_search_locations=[str(TOOLS)])
-release = importlib.util.module_from_spec(spec)
-sys.modules[spec.name] = release
-spec.loader.exec_module(release)
+from .support import BASE, REPOSITORY
+
 
 BUILD_OPENER = urllib.request.build_opener
 TOKEN = "test-only-not-a-real-github-token"
-ASSET_PATH = "/repos/eth-cscs/cscs-oc-review/releases/123/assets?name=cscs-review.yml"
-JSON_PATH = "/repos/eth-cscs/cscs-oc-review/releases"
+ASSET_PATH = BASE + "/releases/123/assets?name=cscs-review.yml"
+JSON_PATH = BASE + "/releases"
+RELEASE_TAG = "v1.2.3"
+DOWNLOAD_PATH = f"/{REPOSITORY}/releases/download/{RELEASE_TAG}/cscs-review-web.yml"
+REDIRECT_STATUSES = (301, 302, 303, 307, 308)
 
 
 @pytest.fixture
@@ -40,8 +37,8 @@ def loopback_github(monkeypatch):
                 "headers": {key.lower(): value for key, value in self.headers.items()},
                 "body": body,
             })
-            status, headers = responses.get(self.path, (200, {}))
-            response = b'{"accepted": true}'
+            status, headers, response = responses.get(
+                self.path, (200, {}, b'{"accepted": true}'))
             self.send_response(status)
             for key, value in headers.items():
                 self.send_header(key, value)
@@ -77,7 +74,7 @@ def loopback_github(monkeypatch):
 
     monkeypatch.setenv("GH_TOKEN", TOKEN)
     monkeypatch.setattr(socket, "create_connection", local_connection)
-    monkeypatch.setattr(release.urllib.request, "build_opener", opener)
+    monkeypatch.setattr(github.urllib.request, "build_opener", opener)
     thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
     thread.start()
     try:
@@ -92,7 +89,7 @@ def loopback_github(monkeypatch):
 def test_binary_upload_reaches_upload_origin_without_byte_corruption(loopback_github, body):
     received, _ = loopback_github
 
-    assert release.github_api(ASSET_PATH, body) == {"accepted": True}
+    assert github.github_api(ASSET_PATH, body) == {"accepted": True}
 
     assert len(received) == 1
     request = received[0]
@@ -109,7 +106,7 @@ def test_binary_upload_reaches_upload_origin_without_byte_corruption(loopback_gi
 def test_json_requests_remain_on_api_origin(loopback_github, payload):
     received, _ = loopback_github
 
-    assert release.github_api(JSON_PATH, payload) == {"accepted": True}
+    assert github.github_api(JSON_PATH, payload) == {"accepted": True}
 
     assert len(received) == 1
     request = received[0]
@@ -124,7 +121,7 @@ def test_json_requests_remain_on_api_origin(loopback_github, payload):
         assert json.loads(request["body"]) == payload
 
 
-@pytest.mark.parametrize("status", [301, 302, 303, 307, 308])
+@pytest.mark.parametrize("status", REDIRECT_STATUSES)
 @pytest.mark.parametrize("destination", [
     "https://api.github.com/redirect-target",
     "https://credential-thief.invalid/redirect-target",
@@ -133,13 +130,57 @@ def test_json_requests_remain_on_api_origin(loopback_github, payload):
 def test_authenticated_redirects_never_reach_the_destination(loopback_github, status, destination, payload):
     received, responses = loopback_github
     path = ASSET_PATH if isinstance(payload, bytes) else JSON_PATH
-    responses[path] = (status, {"Location": destination})
+    responses[path] = (status, {"Location": destination}, b"")
 
     with pytest.raises(ValueError, match="redirects are not allowed"):
-        release.github_api(path, payload)
+        github.github_api(path, payload)
 
     # A redirect would reach this same loopback server even for the hostile host.
     # Observing only the initial request proves no credentials reached the target.
     assert len(received) == 1
     assert received[0]["path"] == path
     assert received[0]["headers"]["authorization"] == "Bearer " + TOKEN
+
+
+@pytest.mark.parametrize("status", REDIRECT_STATUSES)
+def test_public_asset_redirects_preserve_bytes_without_forwarding_credentials(loopback_github, status):
+    received, responses = loopback_github
+    path = DOWNLOAD_PATH
+    body = b"# published caller\r\nallow-web: true\n"
+    responses[path] = (status, {"Location": "https://release-assets.githubusercontent.com/caller"}, b"")
+    responses["/caller"] = (200, {}, body)
+
+    assert post_release.download_caller(RELEASE_TAG) == body
+
+    assert [item["headers"]["host"] for item in received] == [
+        "github.com", "release-assets.githubusercontent.com",
+    ]
+    assert [item["path"] for item in received] == [path, "/caller"]
+    assert all("authorization" not in item["headers"] for item in received)
+    assert all(item["body"] == b"" for item in received)
+
+
+@pytest.mark.parametrize("destination", [
+    "http://release-assets.githubusercontent.com/caller",
+    "https://username:password@release-assets.githubusercontent.com/caller",
+])
+def test_public_asset_redirect_cannot_downgrade_https_or_include_credentials(
+        loopback_github, destination):
+    received, responses = loopback_github
+    path = DOWNLOAD_PATH
+    responses[path] = (302, {"Location": destination}, b"")
+
+    with pytest.raises(ValueError, match="HTTPS without credentials"):
+        post_release.download_caller(RELEASE_TAG)
+
+    assert len(received) == 1
+    assert "authorization" not in received[0]["headers"]
+
+
+def test_oversized_public_asset_fails_instead_of_truncating_the_caller(loopback_github):
+    _, responses = loopback_github
+    path = DOWNLOAD_PATH
+    responses[path] = (200, {}, b"x" * (post_release.MAX_CALLER_BYTES + 1))
+
+    with pytest.raises(ValueError, match="size limit"):
+        post_release.download_caller(RELEASE_TAG)

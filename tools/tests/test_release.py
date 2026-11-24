@@ -4,24 +4,17 @@ The API fixture supplies paginated responses and failures; no test mutates GitHu
 """
 
 import copy
-import importlib.util
-from pathlib import Path
-import sys
 import urllib.error
 import urllib.parse
 
 import pytest
 import yaml
 
+from tools import release
 
-TOOLS = Path(__file__).resolve().parents[1]
-spec = importlib.util.spec_from_file_location(
-    "cscs_release_tests", TOOLS / "release.py", submodule_search_locations=[str(TOOLS)])
-release = importlib.util.module_from_spec(spec)
-sys.modules[spec.name] = release
-spec.loader.exec_module(release)
+from .support import REPOSITORY, RecordedGitHub, http_error
 
-REPOSITORY = "eth-cscs/cscs-oc-review"
+
 REVISION = "a" * 40
 IMAGE = "ghcr.io/eth-cscs/review@sha256:" + "b" * 64
 INVALID_VERSIONS = [
@@ -43,20 +36,14 @@ def successful_run(**changes):
     return run
 
 
-def http_error(code):
-    """Create the urllib error type raised by the production GitHub client."""
-    return urllib.error.HTTPError("https://api.github.com/test", code, "test error", {}, None)
-
-
-class GitHub:
+class GitHub(RecordedGitHub):
     """Record requests and serve configured run/release pages or injected failures."""
 
     def __init__(self):
-        self.calls = []
+        super().__init__()
         self.runs = {1: [successful_run()]}
         self.releases = {1: []}
         self.tag_error = http_error(404)
-        self.repository = {"full_name": REPOSITORY, "default_branch": "main"}
         self.create_error = None
         self.draft = {
             "id": 123, "draft": True,
@@ -66,18 +53,13 @@ class GitHub:
         self.upload_responses = {}
 
     @property
-    def writes(self):
-        """Return recorded POST requests, including requests that raised an error."""
-        return [(path, payload) for path, payload in self.calls if payload is not None]
-
-    @property
     def uploads(self):
         """Return attempted binary uploads in request order."""
         return [(path, payload) for path, payload in self.calls if isinstance(payload, bytes)]
 
     def __call__(self, path, payload=None):
         """Record and dispatch fixture API calls; validate workflow query parameters."""
-        self.calls.append((path, copy.deepcopy(payload)))
+        self.record(path, payload)
         base = f"/repos/{REPOSITORY}"
         if path == base and payload is None:
             return copy.deepcopy(self.repository)
@@ -115,15 +97,6 @@ class GitHub:
                 "state": "uploaded", "name": filename, "size": len(payload),
             }))
         pytest.fail(f"unexpected API request: {path}, {payload!r}")
-
-
-@pytest.fixture(autouse=True)
-def forbid_network(monkeypatch):
-    """Fail every test that attempts to construct the production HTTP client."""
-    def forbidden(*args, **kwargs):
-        pytest.fail("release tests must not access the network")
-
-    monkeypatch.setattr(release.urllib.request, "build_opener", forbidden)
 
 
 @pytest.fixture

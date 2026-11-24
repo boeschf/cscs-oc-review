@@ -191,6 +191,8 @@ The provider maps returned reasoning through `compatibility.reasoningField`; mis
 | [tools/caller.py](tools/caller.py) | Consumer workflow generation |
 | [tools/release.py](tools/release.py), [.github/workflows/prepare-release.yml](.github/workflows/prepare-release.yml) | Source-release eligibility checks and draft preparation |
 | [.cscs/workflows/build-opencode-review-image.yaml](.cscs/workflows/build-opencode-review-image.yaml) | Image build, GHCR publication, and digest verification |
+| [tools/post_release.py](tools/post_release.py), [.github/workflows/prepare-post-release.yml](.github/workflows/prepare-post-release.yml) | Published-release validation and upstream maintenance PR preparation |
+| [tools/github.py](tools/github.py) | Shared GitHub API and release-asset transport |
 | [.github/workflows/checks.yml](.github/workflows/checks.yml) | Regression suites and workflow/YAML/shell validation |
 
 ### Execution and trust boundaries
@@ -290,6 +292,36 @@ A creation or upload failure can leave an incomplete draft, tag, or assets; ther
 Inspect the result and deliberately remove only unpublished leftover state before retrying; never publish an incomplete draft.
 Published immutable releases prevent adding or replacing assets, and their versions cannot be reused.
 
+### Post-release maintenance
+
+The upstream-only [Prepare post-release](.github/workflows/prepare-post-release.yml) workflow handles `release.published` for stable releases in `eth-cscs/cscs-oc-review`.
+It loads trusted helpers from the current default branch, not the release asset or a subscriber checkout, and performs no inference.
+[tools/post_release.py](tools/post_release.py) opens `maintenance/post-release-vX.Y.Z` against the current default branch and updates only these files:
+
+- `VERSION` advances from the published `X.Y.Z` to `X.Y.(Z+1)` for the next development cycle.
+- `.github/workflows/cscs-review.yml` receives the published release's `cscs-review-web.yml` asset unchanged, pinning the released full SHA and enabling web tools.
+
+This installs the upstream repository's own review caller; subscriber installation and upgrades remain manual as described above.
+The maintenance PR runs normal CI; a maintainer reviews and merges it manually.
+There is no automatic merge or modification of the published release.
+
+The workflow uses repository variable `POST_RELEASE_APP_CLIENT_ID` and secret `POST_RELEASE_APP_PRIVATE_KEY` to mint a short-lived App installation token scoped to this repository.
+The token is revoked after the job, and the App bot creates the maintenance commit and PR.
+App credentials are never forwarded to review jobs or inference.
+
+#### Validation and reruns
+
+Preparation rejects a tag/source-version mismatch, a released commit outside the default branch's ancestry, a caller downgrade, and missing or invalid caller assets.
+A new PR also requires the current default-branch `VERSION` to equal the released version.
+The asset must match the released SHA and web-enabled caller setting; it is validated as data and never executed.
+Shared [GitHub transport](tools/github.py) rejects authenticated redirects; public release-asset downloads carry no credentials and allow only HTTPS redirects.
+
+Reruns look up PR history by the deterministic branch even after branch deletion.
+An existing open PR is reused without overwriting its contents, a merged PR is a no-op, and a closed unmerged PR is reported without reopening it.
+A branch left without a PR is recoverable only when it has one commit based on the current default-branch head and its changes match the planned caller/version update.
+Conflicting branch contents or incompatible default-branch state stop preparation for maintainer inspection rather than being overwritten.
+Failures leave the published release unchanged; rerun the failed workflow after resolving the reported conflict or setup issue.
+
 ### Development checks
 
 Run from the repository root with Node.js 24 and uv available:
@@ -301,8 +333,10 @@ bash -n image/entrypoint.sh
 ```
 
 Tests use temporary repositories and controlled child processes, not inference credentials.
+Tooling tests share API request recording and HTTP errors in [tools/tests/support.py](tools/tests/support.py).
+[tools/tests/conftest.py](tools/tests/conftest.py) blocks production urllib clients; transport tests explicitly use a guarded loopback fixture.
 CI additionally runs actionlint and parses CI YAML and embedded shell, including local composite actions.
-Checks and release preparation share [.github/actions/setup-validation-tools/](.github/actions/setup-validation-tools/), which owns Python/uv setup and the verified actionlint installation.
+Checks and both release workflows share [.github/actions/setup-validation-tools/](.github/actions/setup-validation-tools/), which owns Python/uv setup and the optional verified actionlint installation.
 Repeated action references use file-local anchors where possible; bootstrap checkout pins remain literal across files and are maintained by the repository's Dependabot configuration.
 Permissions, checkout inputs, and concurrency remain explicit rather than shared through anchors.
 

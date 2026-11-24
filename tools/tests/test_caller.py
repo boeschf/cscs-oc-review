@@ -1,6 +1,5 @@
 """Exercise literal instruction-path serialization and the caller CLI."""
 
-import importlib.util
 from pathlib import Path
 import subprocess
 import sys
@@ -8,11 +7,10 @@ import sys
 import pytest
 import yaml
 
+from tools import caller
 
-SCRIPT = Path(__file__).resolve().parents[1] / "caller.py"
-spec = importlib.util.spec_from_file_location("cscs_caller_tests", SCRIPT)
-caller = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(caller)
+
+SCRIPT = Path(caller.__file__)
 REVISION = "a" * 40
 
 
