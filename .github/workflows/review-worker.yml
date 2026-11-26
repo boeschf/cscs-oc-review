@@ -67,7 +67,7 @@ jobs:
     env:
       # Use this repository's public runtime; source/configuration are separate mounts.
       # Update only after a separately built image has passed anonymous-pull verification.
-      OPENCODE_REVIEW_IMAGE: ghcr.io/eth-cscs/cscs-oc-review/opencode-review@sha256:d7ab8d43c1b087097b7553cfbdf2732d5da03c87cd594c3ea148be9fcabc9911
+      OPENCODE_REVIEW_IMAGE: ghcr.io/eth-cscs/cscs-oc-review/opencode-review@sha256:5d54af2e5ef77c1851f1c3c698f8fb2f26eff3ca6338e45eea0262571068f1e9
       CREDENTIAL_PROXY_IMAGE: docker.io/library/caddy@sha256:4851e54a46b206517c574821bb5cc67f170d2156041e9fbc4c9193b45e84a75b
     outputs:
       # Pass the API-validated PR number and reviewed SHA to publish, not model-supplied values.
