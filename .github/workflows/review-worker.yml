@@ -111,11 +111,12 @@ jobs:
             --output "$RUNNER_TEMP/opencode-review/input" \
             --github-output "$GITHUB_OUTPUT"
 
-      # Fetch full history for merge-base calculation; treat PR files as data, not executable helpers.
+      # Fetch the API-validated head SHA and full history from the consumer repository.
+      # Treat PR files as data; never execute helpers from this checkout.
       - name: Checkout validated PR head as data
         uses: *checkout_action
         with:
-          repository: ${{ steps.prepare.outputs.head_repository }}
+          repository: ${{ github.repository }}
           ref: ${{ steps.prepare.outputs.head_sha }}
           path: pr-source
           fetch-depth: 0

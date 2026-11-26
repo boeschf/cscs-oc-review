@@ -87,7 +87,8 @@ Search uses TinyFish without a separately configured search credential; service 
 Queries and fetched URLs can disclose repository details outside CSCS.
 Disabling web tools does not restrict networking from the agent's shell.
 Approve CSCS inference access and external-data policy before reviewing private source; this is not an exfiltration-proof sandbox.
-Private-fork access depends on organization and fork-network permissions and requires a deployment check.
+Private-fork access depends on organization and fork-network permissions.
+Private-fork and deleted-fork checkouts require a GitHub deployment check.
 Submodules and Git LFS objects are not fetched, and the workflow does not obtain access to other private dependency repositories.
 
 ### Upgrades

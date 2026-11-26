@@ -29,7 +29,10 @@ Keep cancellation in the entry workflow; sharing its concurrency group with a ca
 | --- | --- | --- |
 | `reviewer-source/` | `job.workflow_repository` and `job.workflow_sha` | Trusted executable helpers and configuration |
 | `repository-default/` | Consumer default branch | Instruction files only |
-| `pr-source/` | API-selected PR-head SHA | Untrusted review data |
+| `pr-source/` | Consumer repository at the API-selected PR-head SHA | Untrusted review data |
+
+The PR head is fetched from the consumer repository, not directly from its fork.
+The fork name is display metadata and may be null for a deleted fork.
 
 Python CLI steps run as modules with `working-directory: reviewer-source`.
 Imports must not resolve from the PR checkout.

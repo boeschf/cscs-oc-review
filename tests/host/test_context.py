@@ -136,6 +136,8 @@ def test_invalid_events_rejected_before_api(kind, change):
     lambda p: p["head"].update(sha="--upload-pack=evil"),
     lambda p: p["head"].update(sha=None),
     lambda p: p["base"].update(sha=True),
+    lambda p: p["head"].update(repo=[]),
+    lambda p: p["base"].update(repo=None),
     lambda p: p["head"].update(ref=None),
     lambda p: p["base"]["repo"].update(full_name="different/repo"),
     lambda p: p["head"]["repo"].update(full_name="https://evil/repo"),
@@ -195,6 +197,18 @@ def test_render_uses_merge_base_without_touching_worktree(history):
     assert (checkout / ".git/index").read_bytes() == before_index
     assert git(checkout, "symbolic-ref", "HEAD") == before_branch
     assert git(checkout, "rev-parse", "HEAD") == metadata["head_sha"]
+
+
+def test_deleted_fork_metadata_can_render_review_context(history):
+    """Prepare a null fork repository and render the committed PR diff from validated SHAs."""
+    checkout, metadata, _ = history
+    response = pr()
+    response["head"].update(sha=metadata["head_sha"], repo=None)
+    response["base"]["sha"] = metadata["base_sha"]
+    prepared = prepare(event("repository-writer"), response)
+    output = context.render(prepared, checkout)
+    assert prepared["head_repository"] is None
+    assert "+review this" in output
 
 
 def test_at_sign_branch_is_reviewed_by_commit(history):
@@ -396,8 +410,9 @@ def test_prepare_history_errors_are_not_silently_dropped():
         context.prepare("issue_comment", event(), REPO, api)
 
 
-def test_cli_prepare_outputs_only_validated_target(tmp_path, monkeypatch):
-    """Write workflow outputs only from validated metadata, not injected trigger-comment text."""
+@pytest.mark.parametrize("head_repository", [REPO, "contributor/fork", None])
+def test_cli_prepare_outputs_only_validated_target(tmp_path, monkeypatch, head_repository):
+    """Keep request text and display-only fork metadata out of workflow outputs."""
     payload = event()
     payload["comment"]["body"] = "/cscs-review\nhead_sha=untrusted"
     event_path = tmp_path / "event.json"
@@ -410,7 +425,9 @@ def test_cli_prepare_outputs_only_validated_target(tmp_path, monkeypatch):
         if path == f"/repos/{REPO}/collaborators/maintainer/permission":
             return {"permission": "write"}
         if path == f"/repos/{REPO}/pulls/17":
-            return pr()
+            response = pr()
+            response["head"]["repo"] = None if head_repository is None else {"full_name": head_repository}
+            return response
         return empty_history_api(path, payload)
 
     monkeypatch.setattr(context, "github_api", api)
@@ -418,9 +435,10 @@ def test_cli_prepare_outputs_only_validated_target(tmp_path, monkeypatch):
                   "--event-path", str(event_path), "--repository", REPO,
                   "--output", str(destination), "--github-output", str(outputs)])
     assert outputs.read_text().splitlines() == [
-        "pr_number=17", f"head_sha={HEAD}", f"head_repository={REPO}"]
+        "pr_number=17", f"head_sha={HEAD}"]
     saved = json.loads((destination / "metadata.json").read_text())
     assert saved["trigger"]["comment"] == payload["comment"]["body"]
+    assert saved["head_repository"] == head_repository
 
 
 def test_render_requires_history_in_prepared_metadata(history):

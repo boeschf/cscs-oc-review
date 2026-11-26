@@ -102,10 +102,12 @@ def prepare(event_name, event, repo, api=None):
     if pr.get("number") != pr_number or pr.get("state") != "open":
         raise ValueError("pull request is not open or number mismatches")
     head, base = mapping(pr.get("head")), mapping(pr.get("base"))
+    # A deleted fork can leave head.repo null; its name is display metadata.
+    head_repo = head.get("repo")
     metadata = {
         "schema_version": 1, "repository": repo, "pr_number": pr_number,
         "head_sha": head.get("sha"), "base_sha": base.get("sha"),
-        "head_repository": mapping(head.get("repo")).get("full_name"),
+        "head_repository": None if head_repo is None else mapping(head_repo).get("full_name"),
         "base_repository": mapping(base.get("repo")).get("full_name"),
         "head_ref": head.get("ref"), "base_ref": base.get("ref"),
         "title": pr.get("title"), "body": pr.get("body") or "",
@@ -124,7 +126,10 @@ def validate_metadata(metadata):
     require_id(metadata.get("pr_number"), field="pull request number")
     for side in ("head", "base"):
         require_sha(metadata.get(side + "_sha"), field="commit SHA")
-        repository(metadata.get(side + "_repository"))
+        repo_name = metadata.get(side + "_repository")
+        # The base repository is required; the fork name is optional display data.
+        if side == "base" or repo_name is not None:
+            repository(repo_name)
         # Branch names are display data; Git operations use the validated SHAs.
         text(metadata.get(side + "_ref"), side + " ref")
     if metadata["base_repository"] != repo:
@@ -319,7 +324,7 @@ def main(argv=None):
             directory.mkdir(parents=True, exist_ok=True)
             (directory / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")
             with Path(args.github_output).open("a") as stream:
-                for key in ("pr_number", "head_sha", "head_repository"):
+                for key in ("pr_number", "head_sha"):
                     stream.write(f"{key}={metadata[key]}\n")
         else:
             metadata_path = Path(args.metadata).resolve(strict=True)
