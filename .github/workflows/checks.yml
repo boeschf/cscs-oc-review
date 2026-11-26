@@ -27,6 +27,21 @@ jobs:
         # Local fixtures and a simulated GitHub API; no inference or release credentials.
         run: uv run --with pytest --with-requirements tools/requirements.txt python -m pytest tests
 
+      - name: Effective OpenCode permission tests
+        # Resolve agent rules with the CLI version from the image recipe; no inference.
+        # Keep CLI checks separate from staging unit tests already run above.
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^ARG OPENCODE_VERSION=//p' image/Containerfile)"
+          test -n "$version"
+          npm install --global --prefix "$RUNNER_TEMP/opencode" --no-audit --no-fund \
+            --allow-scripts=@opencode/cli "@opencode/cli@$version"
+          cli="$RUNNER_TEMP/opencode/bin/opencode"
+          test "$("$cli" --version)" = "opencode v$version"
+          REVIEW_OPENCODE_BIN="$cli" \
+            uv run --with pytest --with-requirements tools/requirements.txt \
+            python -m pytest -q tests/host/test_opencode_permissions.py
+
       - name: Credential proxy Docker integration tests
         # Local deterministic upstream only; no real inference or credentials.
         env:

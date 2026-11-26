@@ -154,28 +154,15 @@ jobs:
       # Disabling web tools does not restrict shell network access.
       # Write configuration under RUNNER_TEMP; leave the checked-out shared configuration unchanged.
       - name: Stage shared runtime configuration
+        working-directory: reviewer-source
         env:
           ALLOW_WEB: ${{ inputs.allow-web }}
         run: |
-          python3 - <<'PY'
-          import json
-          import os
-          from pathlib import Path
-          import shutil
-
-          source = Path("reviewer-source/config")
-          target = Path(os.environ["RUNNER_TEMP"]) / "opencode-review/trusted/config"
-          target.mkdir(parents=True, exist_ok=True)
-          config = json.loads((source / "opencode.json").read_text())
-          if os.environ["ALLOW_WEB"] != "true":
-              config["permissions"].extend(
-                  {"action": action, "resource": "*", "effect": "deny"}
-                  for action in ("websearch", "webfetch")
-              )
-          (target / "opencode.json").write_text(json.dumps(config) + "\n")
-          for filename in ("limits.json", "credential-proxy.json"):
-              shutil.copyfile(source / filename, target / filename)
-          PY
+          set -euo pipefail
+          python3 -m host.runtime_config \
+            --source config \
+            --target "$RUNNER_TEMP/opencode-review/trusted/config" \
+            --allow-web "$ALLOW_WEB"
 
       # Pull both digest-pinned public images before the secret-bearing step, without registry credentials.
       - name: Pull trusted prebuilt reviewer and credential proxy images

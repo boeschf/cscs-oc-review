@@ -10,7 +10,7 @@
 | `image/` | Container definition, phase runner, entrypoint, and baked reviewer policy |
 | `config/` | Trusted model, execution-limit, and credential-proxy configuration |
 | `tests/common/` | Shared transport and identifier contracts |
-| `tests/host/` | Host behavior and opt-in proxy integration; provider fixture in `fixtures/` |
+| `tests/host/` | Host behavior, runtime staging, and opt-in container/CLI checks; provider fixture in `fixtures/` |
 | `tests/tools/` | Caller and release behavior; API recording and errors in `support.py` |
 | `tests/runtime/` | Node.js phase-runner scenarios |
 
@@ -29,12 +29,25 @@ node --test tests/runtime/test-run-review.mjs
 bash -n image/entrypoint.sh
 ```
 
-Ordinary tests use temporary repositories and controlled child processes, require no inference credentials, and skip container integration tests.
+Ordinary tests use temporary repositories and controlled child processes, require no inference credentials, and skip container and CLI integration checks unless explicitly enabled.
 CI also runs actionlint and parses CI YAML and embedded shell, including local composite actions.
 Checks and both release workflows share [.github/actions/setup-validation-tools/](../.github/actions/setup-validation-tools/), which owns Python/uv setup and optional checksum-verified actionlint installation.
 PyYAML is pinned in [tools/requirements.txt](../tools/requirements.txt) for these workflows and local commands; Dependabot checks the pin weekly.
 Repeated action pins use file-local anchors where possible; Dependabot maintains literal cross-file pins.
 Permissions, checkout inputs, and concurrency remain explicit rather than shared through anchors.
+
+## OpenCode permission checks
+
+Set `REVIEW_OPENCODE_BIN` to the absolute path of the OpenCode CLI version declared by `OPENCODE_VERSION` in [image/Containerfile](../image/Containerfile):
+
+```bash
+REVIEW_OPENCODE_BIN=/absolute/path/to/opencode uv run --python 3.12 --with pytest --with-requirements tools/requirements.txt python -m pytest -q tests/host/test_opencode_permissions.py
+```
+
+The tests resolve each review agent's effective permissions for both web settings without inference.
+They use private home/configuration/data/cache directories and do not forward credentials or discover a CLI on `PATH`.
+CI installs and checks the recipe's npm CLI version, then runs only this file; staging unit tests remain in the ordinary suite.
+These checks do not verify the digest-pinned production image.
 
 ## Deterministic container tests
 
