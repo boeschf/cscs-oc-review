@@ -35,10 +35,10 @@
     "cscs": {
       "package": "@opencode/ai/providers/openai-compatible",
       "name": "CSCS Inference",
-      "env": ["CSCS_INFERENCE_API_KEY"],
+      "env": ["CSCS_REVIEW_PROXY_TOKEN"],
       "settings": {
-        "baseURL": "https://api.inference.cscs.ch/v1",
-        "apiKey": "{env:CSCS_INFERENCE_API_KEY}",
+        "baseURL": "{env:CSCS_REVIEW_PROXY_URL}",
+        "apiKey": "{env:CSCS_REVIEW_PROXY_TOKEN}",
         "headerTimeout": 240000,
         "chunkTimeout": 240000
       },

@@ -1,4 +1,3 @@
-import importlib.util
 import json
 import os
 from pathlib import Path
@@ -14,15 +13,6 @@ HELPER = Path(__file__).resolve().parents[1] / "run.py"
 
 
 @pytest.fixture
-def trusted_runner(tmp_path):
-    root = tmp_path / "default-branch"
-    root.mkdir()
-    instructions = root / "AGENTS.md"
-    instructions.write_text("trusted repository instructions\n")
-    return HELPER, instructions
-
-
-@pytest.fixture
 def trusted_config(tmp_path):
     config = tmp_path / "trusted-config"
     config.mkdir()
@@ -31,39 +21,17 @@ def trusted_config(tmp_path):
         "inspection_seconds": 10, "finalization_seconds": 5,
         "execution_overhead_seconds": 13, "termination_grace_seconds": 1,
     }))
+    (config / "credential-proxy.json").write_text(json.dumps({
+        "upstream": "https://api.inference.cscs.ch", "path": "/v1/chat/completions",
+    }))
     return config
-
-
-@pytest.fixture
-def checkout(tmp_path):
-    checkout = tmp_path / "pr-source"
-    checkout.mkdir()
-    (checkout / "app.py").write_text("important source\n")
-    environment = dict(os.environ, GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull)
-    for args in [
-        ["init", "-b", "main"], ["add", "app.py"],
-        ["-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
-         "commit", "-m", "temporary fixture"],
-    ]:
-        subprocess.run(["git", "-C", str(checkout), *args], env=environment,
-                       check=True, capture_output=True)
-    return checkout
-
-
-@pytest.fixture
-def runner(monkeypatch):
-    monkeypatch.syspath_prepend(str(HELPER.parent))
-    spec = importlib.util.spec_from_file_location("review_runner", HELPER)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
 
 
 @pytest.mark.parametrize("target", ["checkout-alias", "context", "instructions-alias", "configuration"])
 def test_runner_cannot_overwrite_inputs(tmp_path, trusted_runner, trusted_config, checkout, target):
     helper, instructions = trusted_runner
     source = checkout / "app.py"
-    environment = dict(os.environ, CSCS_INFERENCE_API_KEY="local-path-safety-test")
+    environment = dict(os.environ, CSCS_INFERENCE_KEY="local-path-safety-test")
     context = tmp_path / "context.md"
     context.write_text("important context\n")
     if target == "checkout-alias":
@@ -82,6 +50,7 @@ def test_runner_cannot_overwrite_inputs(tmp_path, trusted_runner, trusted_config
     # that executable fails. No container or model credentials are needed.
     result = subprocess.run([
         sys.executable, str(helper), "--engine", "/bin/false", "--image", "unused",
+        "--proxy-image", "unused",
         "--checkout", str(checkout), "--context", str(context), "--events", str(output),
         "--instructions", str(instructions), "--config", str(trusted_config),
     ], env=environment, text=True, capture_output=True)
@@ -103,10 +72,11 @@ def test_runner_rejects_pr_supplied_instructions(tmp_path, trusted_config, check
     context = tmp_path / "context.md"
     context.write_text("review input\n")
     output = tmp_path / "events.jsonl"
-    environment = dict(os.environ, CSCS_INFERENCE_API_KEY="local-path-safety-test")
+    environment = dict(os.environ, CSCS_INFERENCE_KEY="local-path-safety-test")
     # A successful real executable makes acceptance observable if the path guard regresses.
     result = subprocess.run([
         sys.executable, str(HELPER), "--engine", "/bin/true", "--image", "unused",
+        "--proxy-image", "unused",
         "--checkout", str(checkout), "--context", str(context), "--events", str(output),
         "--instructions", str(instructions), "--config", str(trusted_config),
     ], env=environment, text=True, capture_output=True)
@@ -117,32 +87,35 @@ def test_runner_rejects_pr_supplied_instructions(tmp_path, trusted_config, check
 
 @pytest.mark.parametrize("changed_source", [False, True])
 def test_cleanup_timeout_preserves_failure_and_checks_source(
-        tmp_path, trusted_runner, trusted_config, checkout, runner, monkeypatch, capsys, changed_source):
+        tmp_path, trusted_runner, trusted_config, checkout, runner, monkeypatch, capsys,
+        engine_factory, changed_source):
     _, instructions = trusted_runner
     context = tmp_path / "context.md"
     context.write_text("review input\n")
-    monkeypatch.setenv("CSCS_INFERENCE_API_KEY", "local-cleanup-test")
+    engine, state = engine_factory(exit_code=1)
+    monkeypatch.setenv("CSCS_INFERENCE_KEY", "local-cleanup-test")
     real_run = subprocess.run
 
     def run(command, *args, **kwargs):
-        if command[:2] == ["/bin/false", "rm"]:
+        if command[:2] == [str(engine), "rm"]:
             if changed_source:
                 (checkout / "app.py").write_text("changed during cleanup\n")
-            # Force the timeout without sleeping or requiring a container daemon.
             raise subprocess.TimeoutExpired(command, kwargs["timeout"])
         return real_run(command, *args, **kwargs)
 
     monkeypatch.setattr(runner.subprocess, "run", run)
     expected = "checkout" if changed_source else "exit 1"
     with pytest.raises(ValueError, match=expected):
-        runner.run_review("/bin/false", "unused", checkout, context,
-                          tmp_path / "events.jsonl", instructions, trusted_config)
+        runner.run_review(str(engine), "unused", checkout, context,
+                          tmp_path / "events.jsonl", instructions, trusted_config, "unused")
     assert "container cleanup failed" in capsys.readouterr().err
     diagnostic = json.loads((tmp_path / "events.diagnostics.json").read_text())
     assert diagnostic["status"] == "failed"
     assert diagnostic["failure"] == ("checkout_changed" if changed_source else "reviewer_exit")
     assert diagnostic["cleanup"] == "failed"
     assert diagnostic["exit_code"] == 1
+    # Network cleanup must still be attempted after container removal times out.
+    assert not json.loads(state.read_text())["network"]
 
 
 def test_progress_reports_silence_without_exposing_event_text(tmp_path, runner, capsys):
@@ -244,7 +217,7 @@ def test_error_diagnostics_distinguish_timeouts_and_http_failures(
 def test_error_artifact_redacts_credentials_before_truncation(
         tmp_path, runner, monkeypatch, capsys):
     secret = 'inference-key/"with spaces'
-    monkeypatch.setenv("CSCS_INFERENCE_API_KEY", secret)
+    monkeypatch.setenv("CSCS_INFERENCE_KEY", secret)
     marker = "UNRETAINED_RESPONSE_PAYLOAD"
     message = (
         f"{secret} {json.dumps(secret)[1:-1]} {runner.quote(secret, safe='')} "
@@ -321,31 +294,19 @@ def test_progress_classifies_tool_results_without_exposing_payload(
 
 @pytest.mark.parametrize("exit_code", [0, 7])
 def test_runner_retains_private_events_and_sanitized_diagnostics(
-        tmp_path, trusted_runner, trusted_config, checkout, runner, monkeypatch, capfd, exit_code):
+        tmp_path, trusted_runner, trusted_config, checkout, runner, monkeypatch, capfd,
+        engine_factory, exit_code):
     _, instructions = trusted_runner
     context = tmp_path / "context.md"
     context.write_text("private context marker\n")
-    engine = tmp_path / "engine"
-    cleanup = tmp_path / "cleanup"
-    engine.write_text(
-        f"#!{sys.executable}\n"
-        "import json, pathlib, sys\n"
-        "if sys.argv[1] == 'rm':\n"
-        f"    pathlib.Path({str(cleanup)!r}).touch()\n"
-        "    sys.exit(0)\n"
-        "print(json.dumps({'type': 'reasoning', 'text': 'private model marker'}))\n"
-        "print(json.dumps({'type': 'private event marker'}))\n"
-        "print('private stderr credential marker', file=sys.stderr)\n"
-        f"sys.exit({exit_code})\n"
-    )
-    engine.chmod(0o700)
-    monkeypatch.setenv("CSCS_INFERENCE_API_KEY", "private credential marker")
+    engine, state = engine_factory(exit_code=exit_code)
+    monkeypatch.setenv("CSCS_INFERENCE_KEY", "private credential marker")
     events = tmp_path / "events.jsonl"
     if exit_code:
         with pytest.raises(ValueError, match=f"exit {exit_code}"):
-            runner.run_review(str(engine), "unused", checkout, context, events, instructions, trusted_config)
+            runner.run_review(str(engine), "unused", checkout, context, events, instructions, trusted_config, "unused")
     else:
-        runner.run_review(str(engine), "unused", checkout, context, events, instructions, trusted_config)
+        runner.run_review(str(engine), "unused", checkout, context, events, instructions, trusted_config, "unused")
     diagnostic_path = tmp_path / "events.diagnostics.json"
     raw = diagnostic_path.read_text()
     diagnostic = json.loads(raw)
@@ -355,8 +316,9 @@ def test_runner_retains_private_events_and_sanitized_diagnostics(
     assert diagnostic["events"] == {"reasoning": 1, "unknown": 1}
     assert diagnostic["summary_complete"] is True
     assert diagnostic["elapsed_seconds"] >= 0
-    assert diagnostic["cleanup"] == ("completed" if exit_code else "not_needed")
-    assert cleanup.exists() == bool(exit_code)
+    assert diagnostic["cleanup"] == "completed"
+    resources = json.loads(state.read_text())
+    assert not resources["containers"] and not resources["network"]
     assert diagnostic_path.stat().st_mode & 0o777 == 0o600
     assert "private model marker" in events.read_text()
     stderr_path = tmp_path / "events.stderr.log"
@@ -367,40 +329,29 @@ def test_runner_retains_private_events_and_sanitized_diagnostics(
 
 
 def test_hanging_reviewer_is_killed_and_container_cleanup_is_bounded(
-        tmp_path, trusted_runner, trusted_config, checkout, runner, monkeypatch):
+        tmp_path, trusted_runner, trusted_config, checkout, runner, monkeypatch, engine_factory):
     _, instructions = trusted_runner
     context = tmp_path / "context.md"
     context.write_text("review input\n")
-    engine = tmp_path / "engine"
-    cleanup = tmp_path / "cleanup"
-    engine.write_text(
-        f"#!{sys.executable}\n"
-        "import pathlib, signal, sys, time\n"
-        "if sys.argv[1] == 'rm':\n"
-        f"    pathlib.Path({str(cleanup)!r}).touch()\n"
-        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
-        "while True:\n"
-        "    time.sleep(60)\n"
-    )
-    engine.chmod(0o700)
-    monkeypatch.setenv("CSCS_INFERENCE_API_KEY", "local-deadline-test")
+    engine, state = engine_factory(hang=True)
+    monkeypatch.setenv("CSCS_INFERENCE_KEY", "local-deadline-test")
     (trusted_config / "limits.json").write_text(json.dumps({
         "inspection_seconds": 0.1, "finalization_seconds": 0.1,
-        "execution_overhead_seconds": 0.1, "termination_grace_seconds": 0.1,
+        "execution_overhead_seconds": 1, "termination_grace_seconds": 0.1,
     }))
-    monkeypatch.setattr(runner, "_CLEANUP_TIMEOUT", 0.5)
     started = time.monotonic()
     with pytest.raises(ValueError, match="hard deadline"):
         runner.run_review(str(engine), "unused", checkout, context,
-                          tmp_path / "events.jsonl", instructions, trusted_config)
+                          tmp_path / "events.jsonl", instructions, trusted_config, "unused")
     assert time.monotonic() - started < 5
     diagnostic = json.loads((tmp_path / "events.diagnostics.json").read_text())
     assert diagnostic["status"] == "failed"
     assert diagnostic["failure"] == "timeout"
     assert diagnostic["exit_code"] == -signal.SIGKILL
     assert diagnostic["process_cleanup"] == "completed"
-    assert diagnostic["cleanup"] == "failed"
-    assert cleanup.exists()
+    assert diagnostic["cleanup"] == "completed"
+    resources = json.loads(state.read_text())
+    assert not resources["containers"] and not resources["network"]
     assert (checkout / "app.py").read_text() == "important source\n"
 
 
@@ -411,15 +362,15 @@ def test_private_outputs_cannot_overwrite_inputs(
     context = tmp_path / "context.md"
     context.write_text("review input\n")
     (tmp_path / f"events.{suffix}").symlink_to(context)
-    monkeypatch.setenv("CSCS_INFERENCE_API_KEY", "local-path-safety-test")
+    monkeypatch.setenv("CSCS_INFERENCE_KEY", "local-path-safety-test")
     with pytest.raises(ValueError, match=suffix.split(".")[0]):
         runner.run_review("/bin/true", "unused", checkout, context,
-                          tmp_path / "events.jsonl", instructions, trusted_config)
+                          tmp_path / "events.jsonl", instructions, trusted_config, "unused")
     assert context.read_text() == "review input\n"
     assert not (tmp_path / "events.jsonl").exists()
 
 
-@pytest.mark.parametrize("target", ["directory", "opencode.json", "limits.json"])
+@pytest.mark.parametrize("target", ["directory", "opencode.json", "limits.json", "credential-proxy.json"])
 def test_runner_rejects_pr_configuration_symlinks(
         tmp_path, trusted_runner, trusted_config, checkout, runner, target):
     _, instructions = trusted_runner
@@ -437,7 +388,7 @@ def test_runner_rejects_pr_configuration_symlinks(
         config = trusted_config
     output = tmp_path / "events.jsonl"
     with pytest.raises(ValueError, match="trusted configuration"):
-        runner.run_review("/bin/true", "unused", checkout, context, output, instructions, config)
+        runner.run_review("/bin/true", "unused", checkout, context, output, instructions, config, "unused")
     assert not output.exists()
 
 
@@ -457,7 +408,99 @@ def test_invalid_limits_fail_before_launch(
     path.write_text(json.dumps(limits | changes))
     output = tmp_path / "events.jsonl"
     with pytest.raises(ValueError, match="limits.json"):
-        runner.run_review("/bin/true", "unused", checkout, context, output, instructions, trusted_config)
+        runner.run_review("/bin/true", "unused", checkout, context, output, instructions, trusted_config, "unused")
     assert not output.exists()
 
 
+
+
+def test_partial_proxy_startup_cleans_network_without_starting_reviewer(
+        tmp_path, trusted_runner, trusted_config, checkout, runner, monkeypatch, engine_factory):
+    _, instructions = trusted_runner
+    engine, state = engine_factory()
+    context = tmp_path / "context.md"
+    context.write_text("review input\n")
+    monkeypatch.setenv("CSCS_INFERENCE_KEY", "canary-key")
+    control = runner.CredentialProxy._run
+
+    def fail_after_network_creation(self, arguments, **kwargs):
+        result = control(self, arguments, **kwargs)
+        if arguments[:2] == ["network", "create"]:
+            raise subprocess.CalledProcessError(1, arguments)
+        return result
+
+    monkeypatch.setattr(runner.CredentialProxy, "_run", fail_after_network_creation)
+    events = tmp_path / "events.jsonl"
+    with pytest.raises(ValueError, match="proxy setup failed"):
+        runner.run_review(str(engine), "unused", checkout, context, events,
+                          instructions, trusted_config, "unused")
+    assert not events.exists()
+    resources = json.loads(state.read_text())
+    assert not resources["network"] and not resources["containers"]
+    diagnostic = json.loads(events.with_suffix(".diagnostics.json").read_text())
+    assert diagnostic["failure"] == "proxy_setup"
+    assert diagnostic["cleanup"] == "completed"
+
+
+def test_cleanup_failure_cannot_report_a_successful_review(
+        tmp_path, trusted_runner, trusted_config, checkout, runner, monkeypatch, engine_factory):
+    _, instructions = trusted_runner
+    engine, state = engine_factory()
+    context = tmp_path / "context.md"
+    context.write_text("review input\n")
+    monkeypatch.setenv("CSCS_INFERENCE_KEY", "canary-key")
+    control = runner.CredentialProxy._run
+
+    def fail_container_listing(self, arguments, **kwargs):
+        if arguments[0] == "ps":
+            raise subprocess.TimeoutExpired(arguments, 0)
+        return control(self, arguments, **kwargs)
+
+    monkeypatch.setattr(runner.CredentialProxy, "_run", fail_container_listing)
+    events = tmp_path / "events.jsonl"
+    with pytest.raises(ValueError, match="could not be cleaned up"):
+        runner.run_review(str(engine), "unused", checkout, context, events,
+                          instructions, trusted_config, "unused")
+    diagnostic = json.loads(events.with_suffix(".diagnostics.json").read_text())
+    assert diagnostic["status"] == "failed" and diagnostic["failure"] == "cleanup_failed"
+    assert not json.loads(state.read_text())["network"]
+
+
+def test_sigterm_reaps_reviewer_and_proxy_resources(
+        tmp_path, trusted_runner, trusted_config, checkout, engine_factory):
+    helper, instructions = trusted_runner
+    engine, state = engine_factory(hang=True)
+    context = tmp_path / "context.md"
+    context.write_text("review input\n")
+    events = tmp_path / "events.jsonl"
+    process = subprocess.Popen([
+        sys.executable, str(helper), "--engine", str(engine), "--image", "unused",
+        "--proxy-image", "unused", "--checkout", str(checkout), "--context", str(context),
+        "--events", str(events), "--instructions", str(instructions), "--config", str(trusted_config),
+    ], env=dict(os.environ, CSCS_INFERENCE_KEY="canary-key"),
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        deadline = time.monotonic() + 5
+        while True:
+            try:
+                containers = json.loads(state.read_text())["containers"]
+                if any(name.endswith("-reviewer") for name in containers):
+                    break
+            except json.JSONDecodeError:
+                pass
+            if process.poll() is not None or time.monotonic() >= deadline:
+                pytest.fail("reviewer did not start before cancellation")
+            time.sleep(0.01)
+        process.send_signal(signal.SIGTERM)
+        stdout, stderr = process.communicate(timeout=5)
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.communicate()
+    assert process.returncode == 130
+    diagnostic = json.loads(events.with_suffix(".diagnostics.json").read_text())
+    assert diagnostic["failure"] == "interrupted"
+    assert diagnostic["cleanup"] == "completed"
+    resources = json.loads(state.read_text())
+    assert not resources["containers"] and not resources["network"]
+    assert "canary-key" not in stdout + stderr

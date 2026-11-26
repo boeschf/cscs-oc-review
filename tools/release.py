@@ -29,7 +29,18 @@ CHECKS_WORKFLOW = ".github/workflows/checks.yml"
 # Positional order matches the disabled/enabled allow_web values in prepare.
 CALLER_FILES = ("cscs-review.yml", "cscs-review-web.yml")
 SHA = re.compile(r"[0-9a-f]{40}\Z", re.ASCII)
-IMAGE = re.compile(r"ghcr\.io/[a-z0-9][a-z0-9._/-]*@sha256:[0-9a-f]{64}\Z", re.ASCII)
+DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z", re.ASCII)
+REVIEWER_IMAGE_REPOSITORY = "ghcr.io/eth-cscs/cscs-oc-review/opencode-review"
+PROXY_IMAGE_REPOSITORY = "docker.io/library/caddy"
+
+
+def require_image_pin(image, repository):
+    """Require an untagged SHA-256 pin from the exact approved image repository."""
+    if not isinstance(image, str):
+        raise ValueError(f"expected a digest-pinned image from {repository}")
+    name, separator, digest = image.partition("@")
+    if name != repository or not separator or not DIGEST.fullmatch(digest):
+        raise ValueError(f"expected a digest-pinned image from {repository}")
 
 
 def require_unused_version(repository, tag, api=github_api):
@@ -98,7 +109,8 @@ def prepare(repository, revision, ref, output, api=github_api):
 
     Run from the trusted checkout of revision. Require the upstream default
     branch, a stable VERSION, successful existing CI, an unused version, and a
-    digest-pinned GHCR image. output must not exist. Return release metadata.
+    digest-pinned reviewer and credential proxy images from approved repositories.
+    output must not exist. Return release metadata.
     This phase reads GitHub state but does not create tags or releases.
     """
     if repository != REPOSITORY or not SHA.fullmatch(revision):
@@ -112,11 +124,14 @@ def prepare(repository, revision, ref, output, api=github_api):
     checks_url = require_successful_checks(repository, revision, branch, api)
     require_unused_version(repository, tag, api)
     worker = yaml.safe_load(Path(".github/workflows/review-worker.yml").read_text(encoding="utf-8"))
-    image = worker["jobs"]["review"]["env"]["OPENCODE_REVIEW_IMAGE"]
-    if not isinstance(image, str) or not IMAGE.fullmatch(image):
-        raise ValueError("the review worker must select a digest-pinned GHCR image")
+    environment = worker["jobs"]["review"]["env"]
+    reviewer_image = environment.get("OPENCODE_REVIEW_IMAGE")
+    proxy_image = environment.get("CREDENTIAL_PROXY_IMAGE")
+    require_image_pin(reviewer_image, REVIEWER_IMAGE_REPOSITORY)
+    require_image_pin(proxy_image, PROXY_IMAGE_REPOSITORY)
     metadata = {"repository": repository, "revision": revision, "version": version,
-                "tag": tag, "image": image, "checks_url": checks_url}
+                "tag": tag, "reviewer_image": reviewer_image, "proxy_image": proxy_image,
+                "checks_url": checks_url}
     output = Path(output)
     output.mkdir(parents=True, exist_ok=False)
     for filename, allow_web in zip(CALLER_FILES, (False, True)):
@@ -127,7 +142,7 @@ def prepare(repository, revision, ref, output, api=github_api):
 
 
 def release_notes(metadata, changes):
-    """Return installation links, provenance, web disclosure, image pin, and changes.
+    """Return installation links, provenance, web disclosure, image pins, and changes.
 
     Download links identify this release, not latest. Caller YAML is distributed
     only as assets so there is no second copy to maintain in the notes.
@@ -152,9 +167,14 @@ def release_notes(metadata, changes):
         "> Web search queries and fetched URLs can disclose repository information outside CSCS.\n"
         "> Enable the web-enabled caller only if your repository's data policy permits it.\n"
         "> Disabling web tools is not a firewall for the agent's shell.\n\n"
-        "## Runtime image\n\n```text\n" + metadata["image"] + "\n```\n\n"
-        "The image is independently pinned by digest.\n"
-        "This source release does not rebuild it.\n\n"
+        "## Runtime images\n\n"
+        "Reviewer:\n\n```text\n" + metadata["reviewer_image"] + "\n```\n\n"
+        "Credential proxy:\n\n```text\n" + metadata["proxy_image"] + "\n```\n\n"
+        "Both images are independently pinned by digest.\n"
+        "This source release does not rebuild them.\n"
+        "Only the credential proxy container receives the real inference key; "
+        "the reviewer receives a per-run proxy URL and token.\n"
+        "This credential boundary does not restrict the reviewer's network egress.\n\n"
         "## Changes\n\n" + changes + "\n"
     )
 
@@ -173,6 +193,8 @@ def create_draft(output, api=github_api):
     repository, revision, tag = metadata["repository"], metadata["revision"], metadata["tag"]
     if repository != REPOSITORY or not SHA.fullmatch(revision) or tag != version_tag(metadata["version"]):
         raise ValueError("invalid prepared release metadata")
+    require_image_pin(metadata.get("reviewer_image"), REVIEWER_IMAGE_REPOSITORY)
+    require_image_pin(metadata.get("proxy_image"), PROXY_IMAGE_REPOSITORY)
     assets = {filename: (output / filename).read_bytes() for filename in CALLER_FILES}
     require_unused_version(repository, tag, api)
     generated = api(f"/repos/{repository}/releases/generate-notes",

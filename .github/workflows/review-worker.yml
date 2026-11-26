@@ -15,7 +15,7 @@ on:
         type: string
     secrets:
       CSCS_INFERENCE_KEY:
-        description: CSCS inference API key; passed only to the inference step
+        description: CSCS inference API key; only the launcher and credential proxy receive it
         required: true
 
 # Deny token permissions by default; each job grants its required scopes.
@@ -56,7 +56,7 @@ jobs:
             core.setOutput('user_id', reaction.user.id);
 
   # Prepare context and run inference with a read-only GitHub token.
-  # Only the container execution step receives the inference secret.
+  # Only the launcher step receives the inference secret; only its proxy container mounts the real key.
   review:
     needs: acknowledge
     runs-on: ubuntu-latest
@@ -68,6 +68,7 @@ jobs:
       # Use this repository's public runtime; source/configuration are separate mounts.
       # Update only after a separately built image has passed anonymous-pull verification.
       OPENCODE_REVIEW_IMAGE: ghcr.io/eth-cscs/cscs-oc-review/opencode-review@sha256:d7ab8d43c1b087097b7553cfbdf2732d5da03c87cd594c3ea148be9fcabc9911
+      CREDENTIAL_PROXY_IMAGE: docker.io/library/caddy@sha256:4851e54a46b206517c574821bb5cc67f170d2156041e9fbc4c9193b45e84a75b
     outputs:
       # Pass the API-validated PR number and reviewed SHA to finish, not model-supplied values.
       pr_number: ${{ steps.prepare.outputs.pr_number }}
@@ -167,24 +168,31 @@ jobs:
                   for action in ("websearch", "webfetch")
               )
           (target / "opencode.json").write_text(json.dumps(config) + "\n")
-          shutil.copyfile(source / "limits.json", target / "limits.json")
+          for filename in ("limits.json", "credential-proxy.json"):
+              shutil.copyfile(source / filename, target / filename)
           PY
 
-      # Pull the digest-pinned public runtime without registry credentials or an image build.
-      - name: Pull trusted prebuilt review image
-        run: docker pull "$OPENCODE_REVIEW_IMAGE"
+      # Pull both digest-pinned public images before the secret-bearing step, without registry credentials.
+      - name: Pull trusted prebuilt reviewer and credential proxy images
+        run: |
+          set -euo pipefail
+          docker pull "$OPENCODE_REVIEW_IMAGE"
+          docker pull "$CREDENTIAL_PROXY_IMAGE"
 
-      # Only the inference key enters the container; no GitHub token, Docker socket, or writable source.
+      # Only the proxy mounts the generated configuration containing the real inference key.
+      # The reviewer receives a per-run proxy URL/token, not the key; shell egress remains unrestricted.
+      # Neither container receives a GitHub token, Docker socket, or writable source.
       # run.py snapshots inputs, enforces the deadline, and checks the source worktree after execution.
       - name: Run isolated CSCS reviewer
         id: reviewer
         env:
-          CSCS_INFERENCE_API_KEY: ${{ secrets.CSCS_INFERENCE_KEY }}
+          CSCS_INFERENCE_KEY: ${{ secrets.CSCS_INFERENCE_KEY }}
         run: |
           set -euo pipefail
           python3 reviewer-source/host/run.py \
             --engine docker \
             --image "$OPENCODE_REVIEW_IMAGE" \
+            --proxy-image "$CREDENTIAL_PROXY_IMAGE" \
             --instructions "$RUNNER_TEMP/opencode-review/trusted/AGENTS.md" \
             --config "$RUNNER_TEMP/opencode-review/trusted/config" \
             --checkout "$GITHUB_WORKSPACE/pr-source" \

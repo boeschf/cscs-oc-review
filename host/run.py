@@ -20,10 +20,10 @@ from urllib.parse import quote, quote_plus
 
 from context import git, worktree_root
 from extract import EVENT_TYPES
+from credential_proxy import CredentialProxy, load_policy
 
 
 _PROGRESS_INTERVAL = 30
-_CLEANUP_TIMEOUT = 30
 _FINISH_REASONS = {"stop", "end_turn", "length", "tool-calls", "content-filter", "error", "unknown"}
 _TOOL_NAMES = {"execute", "glob", "grep", "question", "read", "shell",
                "skill", "subagent", "webfetch", "websearch"}
@@ -101,7 +101,7 @@ def _tool_result(part):
     return f"{name}/{status}"
 
 
-def _report_progress(output, stopped, started, diagnostic=None):
+def _report_progress(output, stopped, started, diagnostic=None, private_values=()):
     previous = 0
     counts = Counter()
     tool_counts = Counter()
@@ -109,13 +109,16 @@ def _report_progress(output, stopped, started, diagnostic=None):
     phase = "none"
     errors = deque(maxlen=_ERROR_DETAIL_LIMIT)
     # These are host credentials, not values taken from untrusted model output.
-    secrets = set()
-    for name in ("CSCS_INFERENCE_API_KEY", "CSCS_API_KEY", "GH_TOKEN", "GITHUB_TOKEN",
+    secrets = set(private_values)
+    for name in ("CSCS_INFERENCE_KEY", "CSCS_API_KEY", "GH_TOKEN", "GITHUB_TOKEN",
                  "ACTIONS_RUNTIME_TOKEN"):
         if value := os.environ.get(name):
-            secrets.update((value, json.dumps(value, ensure_ascii=False)[1:-1],
-                            quote(value, safe=""), quote_plus(value, safe="")))
-    secrets = sorted(secrets, key=len, reverse=True)
+            secrets.add(value)
+    secrets = sorted({
+        variant for value in secrets
+        for variant in (value, json.dumps(value, ensure_ascii=False)[1:-1],
+                        quote(value, safe=""), quote_plus(value, safe=""))
+    }, key=len, reverse=True)
     # A separate descriptor keeps reads from moving the container's stdout write position.
     with open(output.name, "rb") as events:
         while True:
@@ -212,7 +215,7 @@ def checkout_state(checkout):
             git(checkout, "status", "--porcelain=v1", "--untracked-files=all"))
 
 
-def run_review(engine, image, checkout, context, events, instructions, config_dir):
+def run_review(engine, image, checkout, context, events, instructions, config_dir, proxy_image):
     checkout = worktree_root(checkout)
     context = Path(context).resolve(strict=True)
     events = Path(events).resolve()
@@ -226,7 +229,7 @@ def run_review(engine, image, checkout, context, events, instructions, config_di
     if config_dir == checkout or checkout in config_dir.parents:
         raise ValueError("trusted configuration must be outside the PR checkout")
     config_paths = {name: (config_dir / name).resolve(strict=True)
-                    for name in ("opencode.json", "limits.json")}
+                    for name in ("opencode.json", "limits.json", "credential-proxy.json")}
     for path in config_paths.values():
         if not path.is_file() or checkout in path.parents:
             raise ValueError("trusted configuration must contain files outside the PR checkout")
@@ -238,6 +241,7 @@ def run_review(engine, image, checkout, context, events, instructions, config_di
             or any(type(value) not in (int, float) or not math.isfinite(value) or value <= 0
                    for value in limits.values())):
         raise ValueError("limits.json must define positive finite seconds for every execution limit")
+    policy = load_policy(configuration["credential-proxy.json"])
     kill_grace = limits["termination_grace_seconds"]
     # Reserve termination grace for each phase, plus container startup and phase transitions.
     execution_seconds = (limits["inspection_seconds"] + limits["finalization_seconds"]
@@ -255,8 +259,8 @@ def run_review(engine, image, checkout, context, events, instructions, config_di
     if (stderr == checkout or checkout in stderr.parents
             or stderr in inputs or stderr in (events, diagnostics)):
         raise ValueError("stderr output must not overwrite review inputs, events or diagnostics")
-    if not os.environ.get("CSCS_INFERENCE_API_KEY"):
-        raise ValueError("CSCS_INFERENCE_API_KEY is required")
+    if not os.environ.get("CSCS_INFERENCE_KEY"):
+        raise ValueError("CSCS_INFERENCE_KEY is required")
     executable = shutil.which(engine)
     if executable is None:
         raise ValueError("container engine not found")
@@ -265,6 +269,12 @@ def run_review(engine, image, checkout, context, events, instructions, config_di
     # Private host staging permits the unprivileged container UID to read context
     # even when the caller's RUNNER_TEMP files have restrictive owner-only modes.
     with tempfile.TemporaryDirectory(prefix="opencode-context-", dir=events.parent) as staging:
+        started = time.monotonic()
+        run_id = uuid.uuid4().hex
+        proxy = CredentialProxy(
+            executable, proxy_image, run_id, staging, policy,
+            os.environ["CSCS_INFERENCE_KEY"], started + limits["execution_overhead_seconds"],
+        )
         staged_context = Path(staging) / "context.md"
         staged_instructions = Path(staging) / "AGENTS.md"
         for source, destination in ((context, staged_context), (instructions, staged_instructions)):
@@ -273,12 +283,15 @@ def run_review(engine, image, checkout, context, events, instructions, config_di
         staged_config = Path(staging) / "config"
         staged_config.mkdir(mode=0o755)
         for filename, content in configuration.items():
+            if filename == "credential-proxy.json":
+                continue
             destination = staged_config / filename
             destination.write_bytes(content)
             destination.chmod(0o444)
-        name = "opencode-review-" + uuid.uuid4().hex
+        name = f"opencode-review-{run_id}-reviewer"
         command = [
             executable, "run", "--rm", "--name", name, "--pull=never", "--read-only",
+            "--label", proxy.label, "--network", proxy.network,
             "--cap-drop=ALL", "--security-opt=no-new-privileges",
             "--user=1000:1000", "--workdir=/work",
             "--tmpfs=/work:rw,nosuid,nodev,mode=1777",
@@ -287,20 +300,24 @@ def run_review(engine, image, checkout, context, events, instructions, config_di
             "--volume", f"{staged_context}:/input/context.md:ro",
             "--volume", f"{staged_instructions}:/instructions/AGENTS.md:ro",
             "--volume", f"{staged_config}:/opt/reviewer/config/opencode:ro",
-            # Deliberately do not forward GitHub/Actions tokens, SSH agents,
-            # Docker sockets, host HOME, or any other environment variable.
-            "--env", "CSCS_INFERENCE_API_KEY", image,
+            # Only run-scoped proxy credentials enter the reviewer, never the real inference key.
+            "--env", "CSCS_REVIEW_PROXY_URL", "--env", "CSCS_REVIEW_PROXY_TOKEN", image,
         ]
-        started = time.monotonic()
+        environment = dict(os.environ, CSCS_REVIEW_PROXY_URL=proxy.url,
+                           CSCS_REVIEW_PROXY_TOKEN=proxy.token)
         diagnostic = {
             "status": "running", "failure": "none", "exit_code": None,
             "cleanup": "not_needed", "process_cleanup": "not_needed",
             "events": {}, "tools": {}, "phase": "none", "last_finish": "none",
             "stdout_bytes": 0, "summary_complete": False, "elapsed_seconds": 0,
+            "proxy_status": "not_started",
             "errors": [],
         }
         _write_diagnostic(diagnostics, diagnostic)
         try:
+            diagnostic["proxy_status"] = "starting"
+            proxy.start()
+            diagnostic["proxy_status"] = "ready"
             with events.open("w", encoding="utf-8") as output, stderr.open("w", encoding="utf-8") as errors:
                 os.fchmod(output.fileno(), 0o600)
                 os.fchmod(errors.fileno(), 0o600)
@@ -309,14 +326,15 @@ def run_review(engine, image, checkout, context, events, instructions, config_di
                       "(byte counts and fixed event/tool summaries only)", flush=True)
                 stopped = threading.Event()
                 reporter = threading.Thread(target=_report_progress,
-                                            args=(output, stopped, started, diagnostic), daemon=True)
+                                            args=(output, stopped, started, diagnostic, (proxy.token,)), daemon=True)
                 reporter.start()
                 process = None
                 try:
                     # Raw stderr may contain source, model text, or credentials; never log it.
                     process = subprocess.Popen(command, stdout=output, stderr=errors,
-                                               start_new_session=True)
-                    diagnostic["exit_code"] = process.wait(timeout=execution_seconds)
+                                               start_new_session=True, env=environment)
+                    remaining = execution_seconds - (time.monotonic() - started)
+                    diagnostic["exit_code"] = process.wait(timeout=max(0, remaining))
                 except BaseException as error:
                     diagnostic["failure"] = (
                         "timeout" if isinstance(error, subprocess.TimeoutExpired)
@@ -337,21 +355,26 @@ def run_review(engine, image, checkout, context, events, instructions, config_di
                 diagnostic["failure"] = "reviewer_exit"
                 raise ValueError(f"isolated reviewer failed (exit {diagnostic['exit_code']})")
             diagnostic["status"] = "success"
-        except BaseException:
+        except BaseException as error:
             diagnostic["status"] = "failed"
             if diagnostic["failure"] == "none":
-                diagnostic["failure"] = "runner_error"
-            # Cancellation also needs bounded container cleanup, independent of the engine client.
-            try:
-                subprocess.run([executable, "rm", "--force", name], check=True,
-                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                               timeout=_CLEANUP_TIMEOUT)
-                diagnostic["cleanup"] = "completed"
-            except (OSError, subprocess.SubprocessError):
-                diagnostic["cleanup"] = "failed"
-                print("review runner: container cleanup failed", file=sys.stderr)
+                diagnostic["failure"] = (
+                    "timeout" if isinstance(error, subprocess.TimeoutExpired)
+                    else "interrupted" if isinstance(error, KeyboardInterrupt) else "proxy_setup")
+            if isinstance(error, subprocess.TimeoutExpired):
+                raise ValueError("isolated reviewer exceeded its hard deadline during proxy setup") from error
+            if isinstance(error, subprocess.CalledProcessError):
+                raise ValueError("credential proxy setup failed") from error
             raise
         finally:
+            # Cleanup is label-scoped and runs even after success or partial proxy startup.
+            cleaned = proxy.cleanup()
+            diagnostic["cleanup"] = "completed" if cleaned else "failed"
+            if not cleaned:
+                diagnostic["status"] = "failed"
+                if diagnostic["failure"] == "none":
+                    diagnostic["failure"] = "cleanup_failed"
+                print("review runner: container cleanup failed", file=sys.stderr)
             # Cleanup errors must not skip the source-state check or diagnostic persistence.
             try:
                 if checkout_state(checkout) != before:
@@ -364,12 +387,15 @@ def run_review(engine, image, checkout, context, events, instructions, config_di
             finally:
                 diagnostic["elapsed_seconds"] = int(time.monotonic() - started)
                 _write_diagnostic(diagnostics, diagnostic)
+            if diagnostic["failure"] == "cleanup_failed":
+                raise ValueError("review resources could not be cleaned up")
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--engine", default="docker", help="Docker-compatible engine executable")
     parser.add_argument("--image", required=True)
+    parser.add_argument("--proxy-image", required=True, help="digest-pinned credential proxy image")
     parser.add_argument("--checkout", required=True)
     parser.add_argument("--context", required=True)
     parser.add_argument("--instructions", required=True, help="externally staged consumer default-branch instructions")
@@ -382,7 +408,8 @@ def main(argv=None):
 
     previous_handler = signal.signal(signal.SIGTERM, interrupted)
     try:
-        run_review(args.engine, args.image, args.checkout, args.context, args.events, args.instructions, args.config)
+        run_review(args.engine, args.image, args.checkout, args.context, args.events,
+                   args.instructions, args.config, args.proxy_image)
     except (OSError, ValueError) as error:
         parser.exit(1, f"review runner: {error}\n")
     except KeyboardInterrupt:

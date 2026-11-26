@@ -27,6 +27,12 @@ jobs:
         # Local fixtures and a simulated GitHub API; no inference or release credentials.
         run: uv run --with pytest --with pyyaml pytest host/tests tools/tests
 
+      - name: Credential proxy Docker integration tests
+        # Local deterministic upstream only; no real inference or credentials.
+        env:
+          REVIEW_CONTAINER_TEST_ENGINE: docker
+        run: uv run --with pytest --with pyyaml pytest -q host/tests/test_proxy_integration.py
+
       - name: Review runtime tests
         run: node --test image/test-run-review.mjs
 

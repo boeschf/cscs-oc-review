@@ -149,6 +149,7 @@ Consult these configuration sources for the current limits:
 | Control | Definition |
 | --- | --- |
 | Model/provider selection, agent steps, output-token limits, reasoning effort, provider timeouts | [config/opencode.json](config/opencode.json) |
+| Trusted inference upstream and allowed proxy routes | [config/credential-proxy.json](config/credential-proxy.json) |
 | Phase deadlines, startup overhead, termination grace | [config/limits.json](config/limits.json) |
 | Host execution deadline calculation and progress-reporting interval | [host/run.py](host/run.py) |
 | GitHub job timeouts and artifact retention | [.github/workflows/review-worker.yml](.github/workflows/review-worker.yml) |
@@ -185,9 +186,9 @@ The provider maps returned reasoning through `compatibility.reasoningField`; mis
 | [.github/workflows/review.yml](.github/workflows/review.yml) | Public entry point, authorization, and per-PR cancellation |
 | [.github/workflows/review-worker.yml](.github/workflows/review-worker.yml) | Internal worker for receipt acknowledgement, preparation, execution, artifacts, publication, and failure reactions |
 | [host/context.py](host/context.py), [host/history.py](host/history.py) | Request validation, context collection, diff rendering, and instruction assembly |
-| [host/run.py](host/run.py) | Input snapshots, container lifecycle, deadlines, source-state checks, and diagnostics |
+| [host/run.py](host/run.py), [host/credential_proxy.py](host/credential_proxy.py) | Input snapshots, reviewer/proxy lifecycle, private credential configuration, deadlines, source-state checks, and diagnostics |
 | [host/extract.py](host/extract.py) | Phase/session validation and final-response extraction |
-| [config/](config/) | Model settings, tool permissions, and execution limits |
+| [config/](config/) | Model settings, tool permissions, execution limits, and trusted credential-proxy routing policy |
 | [image/](image/) | Container definition, OpenCode phase runner, entrypoint, and reviewer policy |
 | [tools/caller.py](tools/caller.py) | Consumer workflow generation |
 | [tools/release.py](tools/release.py), [.github/workflows/prepare-release.yml](.github/workflows/prepare-release.yml) | Source-release eligibility checks and draft preparation |
@@ -212,10 +213,16 @@ Malformed phases, changed sessions, finalizer tool use, unfinished text, failed 
 | `finish` | `pull-requests: write` | None |
 
 The write-enabled review jobs have no source checkout or model process.
-The container receives the inference key but no GitHub/Actions token, SSH agent, host home directory, or container socket.
+The trusted host launcher receives `CSCS_INFERENCE_KEY` and generates private Caddy configuration containing that key and a random per-run client token.
+Only the proxy mounts this secret configuration; the reviewer receives `CSCS_REVIEW_PROXY_URL` (including `/v1`) and `CSCS_REVIEW_PROXY_TOKEN`, not the CSCS inference key.
+The reviewer receives no GitHub/Actions token, SSH agent, host home directory, or Docker socket.
 It runs as UID/GID 1000 with a read-only root filesystem, dropped capabilities, and `no-new-privileges`.
 Source and supplied inputs are read-only mounts; `/work` and `/tmp` are private writable scratch space.
-The host compares `HEAD` and Git status before and after execution and attempts bounded cleanup on failure or interruption.
+Each run has a Caddy sidecar and dedicated container network; neither container receives a Docker socket, and the proxy has no published ports, admin API, autosave, payload logs, or retries.
+The host compares `HEAD` and Git status before and after execution and attempts bounded cleanup of both containers, the network, and private configuration on success, failure, or cancellation.
+The canonical trusted upstream and route policy is `config/credential-proxy.json`; reviewer-mounted configuration contains no real key and there is no direct-key fallback.
+This is credential separation, not an egress firewall or spending cap: shell networking remains unrestricted, `allow-web` still controls only web tools, and the client token can authorize direct allowed proxy requests.
+Accepted risks include a trusted upstream echoing the real key in a response and container escape exposing host or proxy secrets.
 Policy prohibits editing source, executing PR code or tests, installing packages, and agent-side publication.
 The available shell can still execute readable code; read-only mounts are not an execution barrier.
 
@@ -260,6 +267,8 @@ The image is published as a GHCR package at `ghcr.io/eth-cscs/cscs-oc-review/ope
 Tags follow `opencode-<opencode-version>-amd64-v<image-revision>`.
 Configuration and consumer instructions are mounted separately.
 Runtime or policy changes require a new image build and digest update; configuration-only changes do not.
+The separate proxy dependency is the official multiarchitecture Caddy 2.11.9 image `docker.io/library/caddy@sha256:4851e54a46b206517c574821bb5cc67f170d2156041e9fbc4c9193b45e84a75b`.
+The worker records the reviewer and proxy references in `OPENCODE_REVIEW_IMAGE` and `CREDENTIAL_PROXY_IMAGE`; consumers retain the existing caller inputs and `CSCS_INFERENCE_KEY` secret.
 
 1. Set `OPENCODE_REVIEW_IMAGE` in the [image pipeline](.cscs/workflows/build-opencode-review-image.yaml) to an unused tag.
    The pipeline's `if-not-exists` policy reuses existing tags rather than rebuilding them.
@@ -287,7 +296,7 @@ Before the first major release, incompatible changes increment the minor version
 3. Run **Actions → Prepare release → Run workflow** on that branch.
    It reads `VERSION`, rejects existing tags/releases including drafts, generates both caller variants, and actionlints their YAML without rerunning source suites.
 4. The workflow generates change notes, reserves the version tag at the dispatch SHA, creates a draft, and uploads the exact validated `cscs-review.yml` and `cscs-review-web.yml` files as release assets.
-   Notes link to version-specific downloads and include source provenance, the checks link, and image pin.
+   Notes link to version-specific downloads and include source provenance, the checks link, and both reviewer and proxy image pins.
 5. Inspect the notes and verify both assets before manually publishing the draft and marking it as latest.
 
 Preparation uses repository-scoped `GITHUB_TOKEN` permissions `contents: write` and `actions: read`, without a PAT or inference key.
@@ -335,7 +344,14 @@ node --test image/test-run-review.mjs
 bash -n image/entrypoint.sh
 ```
 
-Tests use temporary repositories and controlled child processes, not inference credentials.
+Ordinary tests use temporary repositories and controlled child processes, not inference credentials, and skip container integration tests by default.
+To run the opt-in deterministic proxy integration suite, use a Linux Docker daemon with working bridge networking:
+
+```bash
+REVIEW_CONTAINER_TEST_ENGINE=docker uv run --python 3.12 --with pytest --with pyyaml pytest -q host/tests/test_proxy_integration.py
+```
+
+The suite reads both pinned image references from the worker YAML and uses fake HTTPS inference and canary keys, without a test repository service or live inference.
 Tooling tests share API request recording and HTTP errors in [tools/tests/support.py](tools/tests/support.py).
 [tools/tests/conftest.py](tools/tests/conftest.py) blocks production urllib clients; transport tests explicitly use a guarded loopback fixture.
 CI additionally runs actionlint and parses CI YAML and embedded shell, including local composite actions.

@@ -4,6 +4,7 @@ The API fixture supplies paginated responses and failures; no test mutates GitHu
 """
 
 import copy
+import json
 import urllib.error
 import urllib.parse
 
@@ -16,7 +17,10 @@ from .support import REPOSITORY, RecordedGitHub, http_error
 
 
 REVISION = "a" * 40
-IMAGE = "ghcr.io/eth-cscs/review@sha256:" + "b" * 64
+REVIEWER_IMAGE_REPOSITORY = "ghcr.io/eth-cscs/cscs-oc-review/opencode-review"
+PROXY_IMAGE_REPOSITORY = "docker.io/library/caddy"
+REVIEWER_IMAGE = REVIEWER_IMAGE_REPOSITORY + "@sha256:" + "b" * 64
+PROXY_IMAGE = PROXY_IMAGE_REPOSITORY + "@sha256:" + "c" * 64
 INVALID_VERSIONS = [
     "v1.2.3", "1.2.3-rc.1", "1.2.3+build", "01.2.3", "1.02.3", "1.2.03",
     "1.2", "١.2.3", "1.2.3\njobs: injected", "1.2.3;$(touch injected)",
@@ -101,13 +105,16 @@ class GitHub(RecordedGitHub):
 
 @pytest.fixture
 def source(tmp_path, monkeypatch):
-    """Provide a temporary source checkout with VERSION and the worker's image pin."""
+    """Provide a temporary source checkout with VERSION and both worker image pins."""
     monkeypatch.chdir(tmp_path)
     (tmp_path / "VERSION").write_text("1.2.3\n", encoding="utf-8")
     worker = tmp_path / ".github" / "workflows" / "review-worker.yml"
     worker.parent.mkdir(parents=True)
     worker.write_text(yaml.safe_dump({
-        "jobs": {"review": {"env": {"OPENCODE_REVIEW_IMAGE": IMAGE}}},
+        "jobs": {"review": {"env": {
+            "OPENCODE_REVIEW_IMAGE": REVIEWER_IMAGE,
+            "CREDENTIAL_PROXY_IMAGE": PROXY_IMAGE,
+        }}},
     }), encoding="utf-8")
     return tmp_path
 
@@ -256,6 +263,48 @@ def test_existing_version_prevents_preparation_and_all_remote_writes(source, exi
     assert not (source / "prepared").exists()
 
 
+@pytest.mark.parametrize("repository", [REVIEWER_IMAGE_REPOSITORY, PROXY_IMAGE_REPOSITORY])
+@pytest.mark.parametrize("suffix", [
+    "", ":latest", ":v1@sha256:" + "b" * 64,
+    "@sha256:" + "b" * 63, "@sha256:" + "b" * 65,
+    "@sha256:" + "B" * 64, "@sha512:" + "b" * 64,
+    "@sha256:" + "b" * 64 + "\n", "@sha256:" + "b" * 64 + "@extra",
+])
+def test_image_pin_requires_exact_digest_not_tag_or_malformed_digest(repository, suffix):
+    with pytest.raises(ValueError, match="digest-pinned image"):
+        release.require_image_pin(repository + suffix, repository)
+
+
+@pytest.mark.parametrize("variable,pin", [
+    ("OPENCODE_REVIEW_IMAGE", None),
+    ("CREDENTIAL_PROXY_IMAGE", None),
+    ("OPENCODE_REVIEW_IMAGE", True),
+    ("CREDENTIAL_PROXY_IMAGE", True),
+    ("OPENCODE_REVIEW_IMAGE", PROXY_IMAGE),
+    ("CREDENTIAL_PROXY_IMAGE", REVIEWER_IMAGE),
+    ("OPENCODE_REVIEW_IMAGE", "ghcr.io/untrusted/reviewer@sha256:" + "b" * 64),
+    ("CREDENTIAL_PROXY_IMAGE", "ghcr.io/library/caddy@sha256:" + "b" * 64),
+    ("CREDENTIAL_PROXY_IMAGE", "docker.io/untrusted/caddy@sha256:" + "b" * 64),
+    ("CREDENTIAL_PROXY_IMAGE", "docker.io/library/caddy/extra@sha256:" + "b" * 64),
+])
+def test_prepare_requires_both_pins_from_their_approved_repositories(source, variable, pin):
+    worker = source / ".github/workflows/review-worker.yml"
+    data = yaml.safe_load(worker.read_text(encoding="utf-8"))
+    environment = data["jobs"]["review"]["env"]
+    if pin is None:
+        environment.pop(variable)
+    else:
+        environment[variable] = pin
+    worker.write_text(yaml.safe_dump(data), encoding="utf-8")
+    api = GitHub()
+
+    with pytest.raises(ValueError, match="digest-pinned image"):
+        release.prepare(REPOSITORY, REVISION, "refs/heads/main", source / "prepared", api)
+
+    assert not api.writes
+    assert not (source / "prepared").exists()
+
+
 @pytest.mark.parametrize("version", ["0.0.0", "12.30.40"])
 def test_prepare_then_create_pins_draft_and_both_caller_variants(source, version):
     (source / "VERSION").write_text(version + "\n", encoding="utf-8")
@@ -265,6 +314,9 @@ def test_prepare_then_create_pins_draft_and_both_caller_variants(source, version
     assert metadata["version"] == version
     assert metadata["tag"] == "v" + version
     assert metadata["revision"] == REVISION
+    assert metadata["reviewer_image"] == REVIEWER_IMAGE
+    assert metadata["proxy_image"] == PROXY_IMAGE
+    assert json.loads((output / "metadata.json").read_text(encoding="utf-8")) == metadata
     assert not api.writes
     prepared = {filename: (output / filename).read_bytes() for filename in release.CALLER_FILES}
     # Creation must use the already validated files, not regenerate from source.
@@ -287,7 +339,8 @@ def test_prepare_then_create_pins_draft_and_both_caller_variants(source, version
     assert payload["tag_name"] == payload["name"] == "v" + version
     notes = payload["body"]
     assert (output / "release-notes.md").read_text(encoding="utf-8") == notes
-    assert IMAGE in notes
+    assert REVIEWER_IMAGE in notes
+    assert PROXY_IMAGE in notes
     assert metadata["checks_url"] in notes
     assert metadata["tag"] in notes
     assert f"https://github.com/{REPOSITORY}/commit/{REVISION}" in notes
@@ -316,6 +369,30 @@ def test_prepare_then_create_pins_draft_and_both_caller_variants(source, version
     assert "with" not in callers[0]["jobs"]["review"]
     assert callers[1]["jobs"]["review"].pop("with") == {"allow-web": True}
     assert callers[0] == callers[1]
+
+
+@pytest.mark.parametrize("field", ["reviewer_image", "proxy_image"])
+@pytest.mark.parametrize("pin", [
+    None, True, "not-an-image", "docker.io/untrusted/image@sha256:" + "b" * 64,
+])
+def test_create_revalidates_both_prepared_pins_before_remote_access(source, field, pin):
+    api = GitHub()
+    output = source / "prepared"
+    release.prepare(REPOSITORY, REVISION, "refs/heads/main", output, api)
+    path = output / "metadata.json"
+    metadata = json.loads(path.read_text(encoding="utf-8"))
+    if pin is None:
+        metadata.pop(field)
+    else:
+        metadata[field] = pin
+    path.write_text(json.dumps(metadata), encoding="utf-8")
+    api.calls.clear()
+
+    with pytest.raises(ValueError, match="digest-pinned image"):
+        release.create_draft(output, api)
+
+    assert not api.calls
+    assert not (output / "release-notes.md").exists()
 
 
 def test_draft_appearing_after_preparation_prevents_creation(source):
