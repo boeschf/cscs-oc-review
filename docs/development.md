@@ -24,7 +24,7 @@ HTTP transport tests explicitly use a guarded loopback fixture.
 Run from the trusted repository root with Node.js 24 and uv available:
 
 ```bash
-uv run --python 3.12 --with pytest --with pyyaml python -m pytest -q tests
+uv run --python 3.12 --with pytest --with-requirements tools/requirements.txt python -m pytest -q tests
 node --test tests/runtime/test-run-review.mjs
 bash -n image/entrypoint.sh
 ```
@@ -32,6 +32,7 @@ bash -n image/entrypoint.sh
 Ordinary tests use temporary repositories and controlled child processes, require no inference credentials, and skip container integration tests.
 CI also runs actionlint and parses CI YAML and embedded shell, including local composite actions.
 Checks and both release workflows share [.github/actions/setup-validation-tools/](../.github/actions/setup-validation-tools/), which owns Python/uv setup and optional checksum-verified actionlint installation.
+PyYAML is pinned in [tools/requirements.txt](../tools/requirements.txt) for these workflows and local commands; Dependabot checks the pin weekly.
 Repeated action pins use file-local anchors where possible; Dependabot maintains literal cross-file pins.
 Permissions, checkout inputs, and concurrency remain explicit rather than shared through anchors.
 
@@ -40,7 +41,7 @@ Permissions, checkout inputs, and concurrency remain explicit rather than shared
 Use a Linux Docker daemon with working bridge networking:
 
 ```bash
-REVIEW_CONTAINER_TEST_ENGINE=docker uv run --python 3.12 --with pytest --with pyyaml python -m pytest -q tests/host/test_proxy_integration.py
+REVIEW_CONTAINER_TEST_ENGINE=docker uv run --python 3.12 --with pytest --with-requirements tools/requirements.txt python -m pytest -q tests/host/test_proxy_integration.py
 ```
 
 The suite reads both image references from the worker YAML and uses fake HTTPS inference and canary keys.

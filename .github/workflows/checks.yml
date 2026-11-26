@@ -25,13 +25,13 @@ jobs:
 
       - name: Shared, host, and release tooling tests
         # Local fixtures and a simulated GitHub API; no inference or release credentials.
-        run: uv run --with pytest --with pyyaml python -m pytest tests
+        run: uv run --with pytest --with-requirements tools/requirements.txt python -m pytest tests
 
       - name: Credential proxy Docker integration tests
         # Local deterministic upstream only; no real inference or credentials.
         env:
           REVIEW_CONTAINER_TEST_ENGINE: docker
-        run: uv run --with pytest --with pyyaml python -m pytest -q tests/host/test_proxy_integration.py
+        run: uv run --with pytest --with-requirements tools/requirements.txt python -m pytest -q tests/host/test_proxy_integration.py
 
       - name: Review runtime tests
         run: node --test tests/runtime/test-run-review.mjs
@@ -41,7 +41,7 @@ jobs:
 
       - name: CI YAML and embedded shell syntax
         run: |
-          uv run --with pyyaml python - <<'PY'
+          uv run --with-requirements tools/requirements.txt python - <<'PY'
           import subprocess
           from pathlib import Path
           import yaml

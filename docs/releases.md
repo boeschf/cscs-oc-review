@@ -50,11 +50,11 @@ Published immutable releases prevent replacing assets or reusing their versions.
 
 ## Generate a caller locally
 
-Use Python 3.12 from the trusted checkout root.
+Run from the trusted checkout root with uv available:
 Replace `FULL_COMMIT_SHA` with a lowercase, 40-character SHA that contains the reusable workflows and is available in the public shared repository:
 
 ```bash
-python3 -m tools.caller --revision FULL_COMMIT_SHA --release-version "$(cat VERSION)" > /tmp/cscs-review.yml
+uv run --python 3.12 --with-requirements tools/requirements.txt python -m tools.caller --revision FULL_COMMIT_SHA --release-version "$(cat VERSION)" > /tmp/cscs-review.yml
 ```
 
 The generator prints YAML without modifying repositories, calling GitHub, or installing workflows.
