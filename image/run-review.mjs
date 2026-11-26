@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url';
 
 const INSPECTION_TOOLS = new Set(['read', 'grep', 'shell', 'execute']);
 
+// Accept only completed local inspection calls without a reported tool failure.
 function successfulInspection(event) {
   const state = event.part?.state;
   const details = state?.metadata?.metadata;
@@ -26,12 +27,15 @@ function stopGroup(child, signal) {
   }
 }
 
+// Forward one JSON event, waiting for stdout backpressure before reading another.
 async function emit(line) {
   if (!process.stdout.write(line + '\n')) await once(process.stdout, 'drain');
 }
 
+// Run one bounded CLI phase, enforcing session continuity and stopping all descendants.
 async function phase(name, agent, prompt, session, budget, control) {
   if (control.interrupted) throw new Error('Review interrupted');
+  // Emit runner-owned boundaries with the session learned during this phase.
   const marker = (state, extra = {}) => emit(JSON.stringify({
     type: 'review_phase', phase: name, state, ...(session ? { sessionID: session } : {}), ...extra,
   }));
@@ -47,18 +51,21 @@ async function phase(name, agent, prompt, session, budget, control) {
   args.push(prompt);
   const child = spawn('opencode', args, { detached: true, stdio: ['ignore', 'pipe', 'inherit'] });
   let escalation;
+  // Request group shutdown and schedule one forced kill after the grace period.
   const stop = signal => {
     stopGroup(child, signal);
     escalation ??= setTimeout(() => stopGroup(child, 'SIGKILL'), budget.killGraceMs);
   };
   control.stop = stop;
   let startupError;
+  // Keep startup failure details while awaiting the close event for cleanup.
   child.once('error', error => { startupError = error; });
   const closed = new Promise(resolve => child.once('close', (code, signal) => resolve({ code, signal })));
   let inspected = false;
   let lastFinish;
   let steps = 0;
   let expired = false;
+  // Stop expired work; inspection may still finalize if it gathered valid evidence.
   const deadline = setTimeout(() => {
     expired = true;
     console.error(`review phases: ${name} deadline reached; stopping OpenCode`);
@@ -121,6 +128,7 @@ async function phase(name, agent, prompt, session, budget, control) {
   }
 }
 
+// Inspect mounted inputs, then finalize in the same session without tool access.
 export async function runReview() {
   const configDirectory = `${process.env.XDG_CONFIG_HOME}/opencode`;
   const config = JSON.parse(await readFile(`${configDirectory}/opencode.json`, 'utf8'));
@@ -134,6 +142,7 @@ export async function runReview() {
   const killGraceMs = limits.termination_grace_seconds * 1000;
   const inspectionSteps = config.agents['grumpy-reviewer'].steps;
   const control = { config };
+  // Forward termination to the active phase and remember cancellation even after CLI exit.
   const handlers = new Map(['SIGINT', 'SIGTERM'].map(signal => [signal, () => {
     control.interrupted = signal;
     control.stop?.(signal);

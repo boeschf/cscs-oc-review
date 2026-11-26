@@ -1,15 +1,10 @@
 import copy
-import importlib.util
-from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
 
-HELPER = Path(__file__).resolve().parents[1] / "history.py"
-spec = importlib.util.spec_from_file_location("review_history", HELPER)
-history = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(history)
+from host import history
 REPO = "eth-cscs/alps-extended-images"
 CREATED = "2026-10-01T12:00:00Z"
 UPDATED = "2026-10-02T13:00:00Z"
@@ -18,14 +13,17 @@ ORIGINAL = "b" * 40
 
 
 def connection(nodes=(), more=False, cursor=None):
+    """Build an explicit GraphQL connection page with selectable pagination metadata."""
     return {"nodes": list(nodes), "pageInfo": {"hasNextPage": more, "endCursor": cursor}}
 
 
 def thread_page(value):
+    """Wrap a connection in the pull-request review-thread response shape."""
     return {"data": {"repository": {"pullRequest": {"reviewThreads": value}}}}
 
 
 def review(identity=1, **changes):
+    """Build an attributed REST review with overrideable state and revision."""
     result = {
         "id": identity, "user": {"login": "review-bot[bot]", "type": "Bot"},
         "body": "Prior review", "state": "COMMENTED", "submitted_at": CREATED,
@@ -36,6 +34,7 @@ def review(identity=1, **changes):
 
 
 def conversation_comment(identity=1, **changes):
+    """Build an attributed REST conversation comment with timestamps and URL."""
     result = {
         "id": identity, "user": {"login": "reviewer", "type": "User"},
         "body": "Please keep the previous review in mind", "created_at": CREATED,
@@ -46,6 +45,7 @@ def conversation_comment(identity=1, **changes):
 
 
 def inline_comment(identity="comment-1", **changes):
+    """Build inline history with revision links, reply metadata, and diff attribution."""
     result = {
         "id": identity, "author": {"login": "review-bot[bot]", "__typename": "Bot"},
         "body": "Earlier inline finding", "createdAt": CREATED, "updatedAt": UPDATED,
@@ -60,6 +60,7 @@ def inline_comment(identity="comment-1", **changes):
 
 
 def thread(identity="thread-1", comments=None, **changes):
+    """Build a review thread with explicit resolution and paginated comments."""
     result = {
         "id": identity, "path": "recipe/config.yaml", "line": 9, "originalLine": 7,
         "isOutdated": False, "isResolved": False, "resolvedBy": None,
@@ -72,12 +73,14 @@ def thread(identity="thread-1", comments=None, **changes):
 
 class HistoryAPI:
     def __init__(self, reviews=(), conversations=(), threads=None, comments=None):
+        """Store independent REST records and caller-selected GraphQL connection pages."""
         self.reviews = list(reviews)
         self.conversations = list(conversations)
         self.threads = {None: connection()} if threads is None else threads
         self.comments = {} if comments is None else comments
 
     def __call__(self, path, payload=None):
+        """Serve deep-copied history pages while asserting endpoint and pagination contracts."""
         if payload is None:
             parsed = urlsplit(path)
             query = parse_qs(parsed.query)
@@ -100,6 +103,7 @@ class HistoryAPI:
 
 
 def test_preserves_prior_reviews_conversation_and_complete_inline_attribution():
+    """Retain review state, deleted authors, revision links, replies, and resolution attribution."""
     root = inline_comment("root")
     reply = inline_comment("reply", author=None, replyTo={"id": "root"},
                            commit=None, originalCommit=None, pullRequestReview=None,
@@ -143,6 +147,7 @@ def test_preserves_prior_reviews_conversation_and_complete_inline_attribution():
 
 @pytest.mark.parametrize("count", [101, 200, 205])
 def test_reads_all_rest_pages_including_empty_terminal_page(count):
+    """Collect all REST records across partial and exact page boundaries."""
     api = HistoryAPI(reviews=[review(i) for i in range(count)],
                      conversations=[conversation_comment(i) for i in range(count)])
 
@@ -153,6 +158,7 @@ def test_reads_all_rest_pages_including_empty_terminal_page(count):
 
 
 def test_reads_over_100_threads_and_replies_on_first_and_later_thread_pages():
+    """Traverse both thread and nested-comment pagination without losing attribution."""
     first_comments = [inline_comment(f"first-{i}", replyTo={"id": "first-0"} if i else None)
                       for i in range(205)]
     last_comments = [inline_comment(f"last-{i}", author={"login": "human", "__typename": "User"})
@@ -183,6 +189,7 @@ def test_reads_over_100_threads_and_replies_on_first_and_later_thread_pages():
 
 @pytest.mark.parametrize("scope", ["threads", "comments"])
 def test_partial_graphql_errors_reject_even_when_data_is_present(scope):
+    """Reject partial GraphQL failures instead of presenting incomplete history as complete."""
     api = HistoryAPI(
         threads={None: connection([thread(comments=connection([inline_comment()], True, "next"))],
                                  cursor="thread-end")},
@@ -190,6 +197,7 @@ def test_partial_graphql_errors_reject_even_when_data_is_present(scope):
     )
 
     def partial_api(path, payload=None):
+        """Inject an error beside otherwise usable data at the selected pagination level."""
         response = api(path, payload)
         if payload is not None and (("id" in payload["variables"]) == (scope == "comments")):
             response["errors"] = [{"message": "history access failed", "path": ["repository"]}]
@@ -206,6 +214,7 @@ def test_partial_graphql_errors_reject_even_when_data_is_present(scope):
     "cursor_cycle", "duplicate_nodes",
 ])
 def test_rejects_malformed_or_nonprogressing_graphql_pagination(scope, fault):
+    """Reject malformed connection metadata, duplicate nodes, and stalled or cyclic cursors."""
     item = thread if scope == "threads" else inline_comment
     pages = {None: connection([item("one")], cursor="end")}
     page = pages[None]
@@ -249,11 +258,13 @@ def test_rejects_malformed_or_nonprogressing_graphql_pagination(scope, fault):
 @pytest.mark.parametrize("scope", ["reviews", "conversation_comments"])
 @pytest.mark.parametrize("fault", ["error_object", "repeated_page"])
 def test_rejects_rest_error_objects_and_nonprogressing_pages(scope, fault):
+    """Reject REST error objects and repeated pages rather than truncating history."""
     item = review if scope == "reviews" else conversation_comment
     endpoint = "/reviews?" if scope == "reviews" else "/comments?"
     api = HistoryAPI()
 
     def broken_api(path, payload=None):
+        """Return the selected REST failure while preserving unrelated history endpoints."""
         if payload is None and endpoint in path:
             if fault == "error_object":
                 return {"message": "API failure"}
@@ -266,11 +277,13 @@ def test_rejects_rest_error_objects_and_nonprogressing_pages(scope, fault):
 
 @pytest.mark.parametrize("missing", ["repository", "pull_request", "thread_node"])
 def test_inaccessible_graphql_objects_are_not_treated_as_empty_history(missing):
+    """Treat inaccessible repositories, PRs, and comment nodes as failures, not empty history."""
     api = HistoryAPI(threads={None: connection([
         thread(comments=connection([inline_comment()], True, "next")),
     ], cursor="thread-end")})
 
     def missing_api(path, payload=None):
+        """Replace the selected GraphQL object with an inaccessible null response."""
         if payload is not None:
             if missing == "repository":
                 return {"data": {"repository": None}}
@@ -285,6 +298,7 @@ def test_inaccessible_graphql_objects_are_not_treated_as_empty_history(missing):
 
 
 def test_review_links_preserve_64_bit_database_ids():
+    """Preserve exact review-to-comment linkage beyond JavaScript integer precision."""
     identity = 2**53 + 1
     api = HistoryAPI(
         reviews=[review(identity)],

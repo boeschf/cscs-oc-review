@@ -1,5 +1,7 @@
 """Fetch complete, inert pull request review history through the trusted API client."""
 
+from common.github import rest_pages
+
 
 COMMENT_FIELDS = """
   id
@@ -48,16 +50,19 @@ query ReviewThreadComments($id: ID!, $cursor: String!) {
 
 
 def _record(value, fields):
+    """Require a history object containing every field consumed by the caller."""
     if not isinstance(value, dict) or any(field not in value for field in fields):
         raise ValueError("malformed GitHub history object")
     return value
 
 
 def _nullable_field(value, field):
+    """Read an optional related object's field without inventing missing attribution."""
     return None if value is None else _record(value, (field,))[field]
 
 
 def _author(value, type_field):
+    """Preserve author identity and type, including deleted accounts."""
     if value is None:
         return None, None
     value = _record(value, ("login", type_field))
@@ -65,6 +70,7 @@ def _author(value, type_field):
 
 
 def _unique(records, seen):
+    """Reject invalid or repeated identities across history pages."""
     for record in records:
         identity = _record(record, ("id",))["id"]
         if (type(identity) not in (int, str) or identity == "" or identity in seen):
@@ -73,21 +79,16 @@ def _unique(records, seen):
 
 
 def _rest_items(path, api):
-    page = 1
+    """Yield complete REST history while rejecting overlapping pages."""
     seen = set()
-    while True:
-        items = api(f"{path}?per_page=100&page={page}")
-        if not isinstance(items, list) or len(items) > 100:
-            raise ValueError("malformed GitHub history REST page")
+    for items in rest_pages(api, path):
         # Repeated identities expose stalled or overlapping pages, not complete history.
         _unique(items, seen)
         yield from items
-        if len(items) < 100:
-            return
-        page += 1
 
 
 def _graphql(api, query, variables):
+    """Require usable GraphQL data without accepting partial-error responses."""
     response = _record(api("/graphql", {"query": query, "variables": variables}), ("data",))
     if "errors" in response:
         raise ValueError("GitHub GraphQL returned history errors")
@@ -95,6 +96,7 @@ def _graphql(api, query, variables):
 
 
 def _connection(value, cursors, identities):
+    """Validate a connection page and require unique nodes and advancing cursors."""
     value = _record(value, ("nodes", "pageInfo"))
     nodes = value["nodes"]
     info = _record(value["pageInfo"], ("hasNextPage", "endCursor"))
@@ -112,6 +114,7 @@ def _connection(value, cursors, identities):
 
 
 def _review(value):
+    """Normalize a review while retaining attribution, state, and revision."""
     value = _record(value, ("id", "user", "body", "state", "commit_id", "html_url"))
     author, author_type = _author(value["user"], "type")
     return {
@@ -123,6 +126,7 @@ def _review(value):
 
 
 def _conversation_comment(value):
+    """Normalize a conversation comment without interpreting its body."""
     value = _record(value, ("id", "user", "body", "created_at", "updated_at", "html_url"))
     author, author_type = _author(value["user"], "type")
     return {
@@ -133,6 +137,7 @@ def _conversation_comment(value):
 
 
 def _thread_comment(value):
+    """Normalize inline attribution, revision links, reply chains, and diff context."""
     value = _record(value, ("id", "author", "body", "createdAt", "updatedAt", "url",
                             "commit", "originalCommit", "replyTo", "pullRequestReview",
                             "diffHunk", "path", "line", "originalLine"))
@@ -151,6 +156,7 @@ def _thread_comment(value):
 
 
 def _thread(value, api):
+    """Collect every comment page for one identity-checked review thread."""
     value = _record(value, ("id", "path", "line", "originalLine", "isOutdated", "isResolved",
                             "resolvedBy", "comments"))
     result = {

@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Prepare release callers and attach them to an unpublished GitHub release.
 
 Run prepare from the trusted source checkout, lint both generated callers, then
@@ -15,20 +14,14 @@ import urllib.parse
 
 import yaml
 
-if __package__:
-    from .caller import version_tag, workflow
-    from .github import github_api
-else:
-    from caller import version_tag, workflow
-    from github import github_api
+from common.github import github_api, rest_pages, upload_asset
+from common.identifiers import require_id, require_sha
+
+from .caller import workflow
+from . import release_contract as contract
 
 
-# Release preparation and creation accept only this upstream repository.
-REPOSITORY = "eth-cscs/cscs-oc-review"
 CHECKS_WORKFLOW = ".github/workflows/checks.yml"
-# Positional order matches the disabled/enabled allow_web values in prepare.
-CALLER_FILES = ("cscs-review.yml", "cscs-review-web.yml")
-SHA = re.compile(r"[0-9a-f]{40}\Z", re.ASCII)
 DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z", re.ASCII)
 REVIEWER_IMAGE_REPOSITORY = "ghcr.io/eth-cscs/cscs-oc-review/opencode-review"
 PROXY_IMAGE_REPOSITORY = "docker.io/library/caddy"
@@ -41,6 +34,12 @@ def require_image_pin(image, repository):
     name, separator, digest = image.partition("@")
     if name != repository or not separator or not DIGEST.fullmatch(digest):
         raise ValueError(f"expected a digest-pinned image from {repository}")
+
+
+def require_image_pins(reviewer_image, proxy_image):
+    """Validate the independently pinned reviewer/proxy pair at each release phase."""
+    require_image_pin(reviewer_image, REVIEWER_IMAGE_REPOSITORY)
+    require_image_pin(proxy_image, PROXY_IMAGE_REPOSITORY)
 
 
 def require_unused_version(repository, tag, api=github_api):
@@ -57,16 +56,9 @@ def require_unused_version(repository, tag, api=github_api):
     else:
         raise ValueError(f"tag {tag} already exists; existing versions are never overwritten")
     # The tag lookup alone cannot find an unpublished draft with no Git tag yet.
-    page = 1
-    while True:
-        releases = api(f"/repos/{repository}/releases?per_page=100&page={page}")
-        if not isinstance(releases, list):
-            raise ValueError("malformed GitHub releases response")
+    for releases in rest_pages(api, f"/repos/{repository}/releases"):
         if any(release["tag_name"] == tag for release in releases):
             raise ValueError(f"release {tag} already exists, including drafts")
-        if len(releases) < 100:
-            return
-        page += 1
 
 
 def require_successful_checks(repository, revision, branch, api=github_api):
@@ -78,22 +70,16 @@ def require_successful_checks(repository, revision, branch, api=github_api):
     Raise ValueError if no eligible run exists or the latest is not successful.
     """
     candidates = []
-    page = 1
-    while True:
-        query = urllib.parse.urlencode({"head_sha": revision, "event": "push", "branch": branch,
-                                        "per_page": 100, "page": page})
-        response = api(f"/repos/{repository}/actions/workflows/checks.yml/runs?{query}")
-        runs = response["workflow_runs"]
-        if not isinstance(runs, list):
-            raise ValueError("malformed GitHub workflow runs response")
+    for runs in rest_pages(
+        api, f"/repos/{repository}/actions/workflows/checks.yml/runs",
+        params={"head_sha": revision, "event": "push", "branch": branch},
+        items_key="workflow_runs",
+    ):
         candidates.extend(run for run in runs
                           if run.get("head_sha") == revision and run.get("head_branch") == branch
                           and run.get("event") == "push" and run.get("path") == CHECKS_WORKFLOW
                           and run.get("repository", {}).get("full_name") == repository
                           and run.get("head_repository", {}).get("full_name") == repository)
-        if len(runs) < 100:
-            break
-        page += 1
     if not candidates:
         raise ValueError(f"no checks.yml push run found for {revision} on {branch}; run upstream CI first")
     # A rerun keeps its run ID; its attempt number determines recency within that run.
@@ -113,10 +99,11 @@ def prepare(repository, revision, ref, output, api=github_api):
     output must not exist. Return release metadata.
     This phase reads GitHub state but does not create tags or releases.
     """
-    if repository != REPOSITORY or not SHA.fullmatch(revision):
-        raise ValueError("release preparation requires the upstream repository and a full commit SHA")
+    if repository != contract.REPOSITORY:
+        raise ValueError("release preparation requires the upstream repository")
+    require_sha(revision, field="release revision")
     version = Path("VERSION").read_text(encoding="utf-8").strip()
-    tag = version_tag(version)
+    tag = contract.version_tag(version)
     source = api(f"/repos/{repository}")
     branch = source["default_branch"]
     if source["full_name"] != repository or ref != "refs/heads/" + branch:
@@ -127,14 +114,13 @@ def prepare(repository, revision, ref, output, api=github_api):
     environment = worker["jobs"]["review"]["env"]
     reviewer_image = environment.get("OPENCODE_REVIEW_IMAGE")
     proxy_image = environment.get("CREDENTIAL_PROXY_IMAGE")
-    require_image_pin(reviewer_image, REVIEWER_IMAGE_REPOSITORY)
-    require_image_pin(proxy_image, PROXY_IMAGE_REPOSITORY)
+    require_image_pins(reviewer_image, proxy_image)
     metadata = {"repository": repository, "revision": revision, "version": version,
                 "tag": tag, "reviewer_image": reviewer_image, "proxy_image": proxy_image,
                 "checks_url": checks_url}
     output = Path(output)
     output.mkdir(parents=True, exist_ok=False)
-    for filename, allow_web in zip(CALLER_FILES, (False, True)):
+    for filename, allow_web in contract.CALLER_VARIANTS:
         (output / filename).write_text(
             workflow(revision, allow_web=allow_web, release_version=version), encoding="utf-8")
     (output / "metadata.json").write_text(json.dumps(metadata) + "\n", encoding="utf-8")
@@ -149,16 +135,16 @@ def release_notes(metadata, changes):
     """
     repository, revision = metadata["repository"], metadata["revision"]
     downloads = f"https://github.com/{repository}/releases/download/{metadata['tag']}"
-    standard, web = (f"{downloads}/{filename}" for filename in CALLER_FILES)
+    standard, web = (f"{downloads}/{filename}" for filename, _ in contract.CALLER_VARIANTS)
     return (
         "## Installation\n\n"
         f"Source version: **{metadata['tag']}** · "
         f"[Commit `{revision}`](https://github.com/{repository}/commit/{revision}) · "
         f"[Successful checks]({metadata['checks_url']})\n\n"
         "Download **one** caller from this release:\n\n"
-        f"- [{CALLER_FILES[0]}]({standard}): web tools disabled; recommended default.\n"
-        f"- [{CALLER_FILES[1]}]({web}): web tools enabled; explicit opt-in.\n\n"
-        "Save either download as `.github/workflows/cscs-review.yml` in the subscriber repository "
+        f"- [{contract.DEFAULT_CALLER_ASSET}]({standard}): web tools disabled; recommended default.\n"
+        f"- [{contract.WEB_CALLER_ASSET}]({web}): web tools enabled; explicit opt-in.\n\n"
+        f"Save either download as `{contract.CALLER_PATH}` in the subscriber repository "
         "and merge it into its default branch.\n"
         "Provide the `CSCS_INFERENCE_KEY` Actions secret, then post `/cscs-review` on a PR.\n"
         "The requester needs repository write access.\n"
@@ -179,7 +165,7 @@ def release_notes(metadata, changes):
     )
 
 
-def create_draft(output, api=github_api):
+def create_draft(output, api=github_api, *, upload=upload_asset):
     """Create a tag and draft, upload both callers, then return the draft URL.
 
     Caller files must have passed actionlint; read their exact bytes without
@@ -191,11 +177,11 @@ def create_draft(output, api=github_api):
     output = Path(output)
     metadata = json.loads((output / "metadata.json").read_text(encoding="utf-8"))
     repository, revision, tag = metadata["repository"], metadata["revision"], metadata["tag"]
-    if repository != REPOSITORY or not SHA.fullmatch(revision) or tag != version_tag(metadata["version"]):
+    if repository != contract.REPOSITORY or tag != contract.version_tag(metadata["version"]):
         raise ValueError("invalid prepared release metadata")
-    require_image_pin(metadata.get("reviewer_image"), REVIEWER_IMAGE_REPOSITORY)
-    require_image_pin(metadata.get("proxy_image"), PROXY_IMAGE_REPOSITORY)
-    assets = {filename: (output / filename).read_bytes() for filename in CALLER_FILES}
+    require_sha(revision, field="prepared release revision")
+    require_image_pins(metadata.get("reviewer_image"), metadata.get("proxy_image"))
+    assets = {filename: (output / filename).read_bytes() for filename, _ in contract.CALLER_VARIANTS}
     require_unused_version(repository, tag, api)
     generated = api(f"/repos/{repository}/releases/generate-notes",
                     {"tag_name": tag, "target_commitish": revision})
@@ -206,12 +192,12 @@ def create_draft(output, api=github_api):
     release = api(f"/repos/{repository}/releases",
                   {"tag_name": tag, "target_commitish": revision, "name": tag,
                    "body": notes, "draft": True, "prerelease": False})
-    release_id = release.get("id")
-    if type(release_id) is not int or release_id <= 0 or release.get("draft") is not True:
+    release_id = require_id(release.get("id"), field="draft release ID")
+    if release.get("draft") is not True:
         raise ValueError("GitHub did not return an identified draft release")
     for filename, content in assets.items():
         query = urllib.parse.urlencode({"name": filename})
-        asset = api(f"/repos/{repository}/releases/{release_id}/assets?{query}", content)
+        asset = upload(f"/repos/{repository}/releases/{release_id}/assets?{query}", content)
         if (asset.get("state") != "uploaded" or asset.get("name") != filename
                 or asset.get("size") != len(content)):
             raise ValueError(f"release asset {filename} was not uploaded completely")

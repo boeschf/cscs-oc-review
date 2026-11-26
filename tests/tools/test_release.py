@@ -21,10 +21,7 @@ REVIEWER_IMAGE_REPOSITORY = "ghcr.io/eth-cscs/cscs-oc-review/opencode-review"
 PROXY_IMAGE_REPOSITORY = "docker.io/library/caddy"
 REVIEWER_IMAGE = REVIEWER_IMAGE_REPOSITORY + "@sha256:" + "b" * 64
 PROXY_IMAGE = PROXY_IMAGE_REPOSITORY + "@sha256:" + "c" * 64
-INVALID_VERSIONS = [
-    "v1.2.3", "1.2.3-rc.1", "1.2.3+build", "01.2.3", "1.02.3", "1.2.03",
-    "1.2", "١.2.3", "1.2.3\njobs: injected", "1.2.3;$(touch injected)",
-]
+CALLER_FILES = ("cscs-review.yml", "cscs-review-web.yml")
 
 
 def successful_run(**changes):
@@ -44,6 +41,7 @@ class GitHub(RecordedGitHub):
     """Record requests and serve configured run/release pages or injected failures."""
 
     def __init__(self):
+        """Start with eligible CI, an unused version, and successful upload responses."""
         super().__init__()
         self.runs = {1: [successful_run()]}
         self.releases = {1: []}
@@ -94,7 +92,7 @@ class GitHub(RecordedGitHub):
             query = urllib.parse.parse_qs(urllib.parse.urlsplit(path).query)
             assert set(query) == {"name"}
             filename, = query["name"]
-            assert filename in release.CALLER_FILES
+            assert filename in CALLER_FILES
             if filename in self.upload_errors:
                 raise self.upload_errors[filename]
             return copy.deepcopy(self.upload_responses.get(filename, {
@@ -119,10 +117,45 @@ def source(tmp_path, monkeypatch):
     return tmp_path
 
 
-@pytest.mark.parametrize("version", INVALID_VERSIONS)
-def test_version_validation_rejects_non_source_semver(version):
-    with pytest.raises(ValueError, match="MAJOR.MINOR.PATCH"):
-        release.version_tag(version)
+@pytest.fixture
+def prepared_release(source):
+    """Prepare one eligible release while keeping each scenario's API independent."""
+    api = GitHub()
+    output = source / "prepared"
+    release.prepare(REPOSITORY, REVISION, "refs/heads/main", output, api)
+    return api, output
+
+
+@pytest.mark.parametrize("endpoint", ["checks", "releases"])
+def test_malformed_later_page_prevents_preparation_and_all_writes(source, endpoint):
+    """Abort each eligibility scan on a malformed later page before producing files."""
+    api = GitHub()
+    if endpoint == "checks":
+        api.runs = {1: [successful_run(id=n) for n in range(1, 101)], 2: None}
+    else:
+        api.releases = {
+            1: [{"tag_name": f"v0.0.{n}"} for n in range(100)], 2: None,
+        }
+    output = source / "prepared"
+    with pytest.raises(ValueError, match="malformed GitHub REST page"):
+        release.prepare(REPOSITORY, REVISION, "refs/heads/main", output, api)
+    assert api.calls[-1][0].endswith("page=2")
+    assert not api.writes
+    assert not output.exists()
+
+
+def test_malformed_release_page_prevents_creation_before_all_writes(prepared_release):
+    """Recheck every release page before generating notes or reserving a tag."""
+    api, output = prepared_release
+    api.calls.clear()
+    api.releases = {
+        1: [{"tag_name": f"v0.0.{n}"} for n in range(100)], 2: None,
+    }
+    with pytest.raises(ValueError, match="malformed GitHub REST page"):
+        release.create_draft(output, api, upload=api)
+    assert api.calls[-1][0].endswith("page=2")
+    assert not api.writes
+    assert not (output / "release-notes.md").exists()
 
 
 @pytest.mark.parametrize("changes", [
@@ -132,6 +165,7 @@ def test_version_validation_rejects_non_source_semver(version):
     {"head_repository": {"full_name": "contributor/fork"}},
 ])
 def test_success_from_an_untrusted_run_cannot_authorize_release(changes):
+    """Prevent fork, wrong-event, and wrong-workflow successes from authorizing a release."""
     api = GitHub()
     api.runs[1] = [successful_run(**changes)]
     with pytest.raises(ValueError, match="no checks.yml push run"):
@@ -144,6 +178,7 @@ def test_success_from_an_untrusted_run_cannot_authorize_release(changes):
     [successful_run(conclusion="failure")],
 ])
 def test_missing_pending_or_failed_checks_block_release(runs):
+    """Require a completed successful upstream check rather than merely an existing run."""
     api = GitHub()
     api.runs[1] = runs
     with pytest.raises(ValueError):
@@ -155,6 +190,7 @@ def test_missing_pending_or_failed_checks_block_release(runs):
     successful_run(id=10, run_attempt=2, conclusion="failure"),
 ])
 def test_newer_failure_supersedes_older_success_even_when_listed_first(newer):
+    """Rank run IDs and rerun attempts before evaluating the latest conclusion."""
     api = GitHub()
     api.runs[1] = [newer, successful_run()]
     with pytest.raises(ValueError, match="latest checks.yml run"):
@@ -163,6 +199,7 @@ def test_newer_failure_supersedes_older_success_even_when_listed_first(newer):
 
 @pytest.mark.parametrize("conclusion", ["success", "failure"])
 def test_checks_scan_later_pages_before_selecting_latest(conclusion):
+    """Use later-page runs when choosing the latest eligible CI result."""
     api = GitHub()
     api.runs = {
         1: [successful_run(id=number) for number in range(1, 101)],
@@ -178,6 +215,7 @@ def test_checks_scan_later_pages_before_selecting_latest(conclusion):
 
 
 def test_existing_tag_blocks_version_without_scanning_releases():
+    """Stop immediately when an immutable release tag already exists."""
     api = GitHub()
     api.tag_error = None
     with pytest.raises(ValueError, match="tag v1.2.3 already exists"):
@@ -187,6 +225,7 @@ def test_existing_tag_blocks_version_without_scanning_releases():
 
 
 def test_existing_draft_on_later_release_page_blocks_version():
+    """Reject unpublished drafts even when they appear beyond the first page."""
     api = GitHub()
     api.releases = {
         1: [{"tag_name": f"v0.0.{number}", "draft": False} for number in range(100)],
@@ -199,6 +238,7 @@ def test_existing_draft_on_later_release_page_blocks_version():
 
 
 def test_only_missing_tag_and_no_release_allow_a_new_version():
+    """Allow a fresh version only after checking both tags and all releases."""
     api = GitHub()
     release.require_unused_version(REPOSITORY, "v1.2.3", api)
     assert [path for path, _ in api.calls] == [
@@ -210,6 +250,7 @@ def test_only_missing_tag_and_no_release_allow_a_new_version():
 
 @pytest.mark.parametrize("error", [http_error(403), http_error(500), urllib.error.URLError("offline")])
 def test_tag_lookup_errors_fail_closed(error):
+    """Propagate tag-lookup failures instead of treating them as absence."""
     api = GitHub()
     api.tag_error = error
     with pytest.raises(type(error)) as caught:
@@ -220,6 +261,7 @@ def test_tag_lookup_errors_fail_closed(error):
 
 
 def test_invalid_source_version_cannot_prepare_or_access_remote(source):
+    """Validate source version syntax before any remote lookup or generated output."""
     (source / "VERSION").write_text("1.2.3\nmalicious: true\n", encoding="utf-8")
     api = GitHub()
     with pytest.raises(ValueError, match="MAJOR.MINOR.PATCH"):
@@ -234,6 +276,7 @@ def test_invalid_source_version_cannot_prepare_or_access_remote(source):
     (REPOSITORY, "refs/tags/v1.2.3"),
 ])
 def test_wrong_repository_or_ref_cannot_prepare(source, repository, ref):
+    """Restrict preparation to the canonical repository's default-branch ref."""
     api = GitHub()
     with pytest.raises(ValueError, match="upstream"):
         release.prepare(repository, REVISION, ref, source / "prepared", api)
@@ -242,6 +285,7 @@ def test_wrong_repository_or_ref_cannot_prepare(source, repository, ref):
 
 
 def test_api_repository_identity_must_match_upstream(source):
+    """Reject API repository metadata that disagrees with the upstream identity."""
     api = GitHub()
     api.repository["full_name"] = "contributor/fork"
     with pytest.raises(ValueError, match="upstream default branch"):
@@ -252,6 +296,7 @@ def test_api_repository_identity_must_match_upstream(source):
 
 @pytest.mark.parametrize("existing", ["tag", "draft"])
 def test_existing_version_prevents_preparation_and_all_remote_writes(source, existing):
+    """Leave no prepared output or remote writes when a tag or draft claims the version."""
     api = GitHub()
     if existing == "tag":
         api.tag_error = None
@@ -271,6 +316,7 @@ def test_existing_version_prevents_preparation_and_all_remote_writes(source, exi
     "@sha256:" + "b" * 64 + "\n", "@sha256:" + "b" * 64 + "@extra",
 ])
 def test_image_pin_requires_exact_digest_not_tag_or_malformed_digest(repository, suffix):
+    """Accept only an untagged approved repository with a complete lowercase SHA-256 pin."""
     with pytest.raises(ValueError, match="digest-pinned image"):
         release.require_image_pin(repository + suffix, repository)
 
@@ -288,6 +334,7 @@ def test_image_pin_requires_exact_digest_not_tag_or_malformed_digest(repository,
     ("CREDENTIAL_PROXY_IMAGE", "docker.io/library/caddy/extra@sha256:" + "b" * 64),
 ])
 def test_prepare_requires_both_pins_from_their_approved_repositories(source, variable, pin):
+    """Validate each image independently before writing either caller variant."""
     worker = source / ".github/workflows/review-worker.yml"
     data = yaml.safe_load(worker.read_text(encoding="utf-8"))
     environment = data["jobs"]["review"]["env"]
@@ -307,6 +354,7 @@ def test_prepare_requires_both_pins_from_their_approved_repositories(source, var
 
 @pytest.mark.parametrize("version", ["0.0.0", "12.30.40"])
 def test_prepare_then_create_pins_draft_and_both_caller_variants(source, version):
+    """Publish both captured caller byte streams with exact source and image provenance."""
     (source / "VERSION").write_text(version + "\n", encoding="utf-8")
     api = GitHub()
     output = source / "prepared"
@@ -318,11 +366,11 @@ def test_prepare_then_create_pins_draft_and_both_caller_variants(source, version
     assert metadata["proxy_image"] == PROXY_IMAGE
     assert json.loads((output / "metadata.json").read_text(encoding="utf-8")) == metadata
     assert not api.writes
-    prepared = {filename: (output / filename).read_bytes() for filename in release.CALLER_FILES}
+    prepared = {filename: (output / filename).read_bytes() for filename in CALLER_FILES}
     # Creation must use the already validated files, not regenerate from source.
     (source / "VERSION").write_text("99.99.99\n", encoding="utf-8")
 
-    url = release.create_draft(output, api)
+    url = release.create_draft(output, api, upload=api)
     assert url == "https://github.com/eth-cscs/cscs-oc-review/releases/123"
     generated, reserved, created, *uploaded = api.writes
     assert generated == (f"/repos/{REPOSITORY}/releases/generate-notes", {
@@ -349,7 +397,7 @@ def test_prepare_then_create_pins_draft_and_both_caller_variants(source, version
     assert "Generated changes from merged pull requests." in notes
     assert len(uploaded) == 2
     callers = []
-    for upload, filename, allow_web in zip(uploaded, release.CALLER_FILES, (False, True)):
+    for upload, filename, allow_web in zip(uploaded, CALLER_FILES, (False, True)):
         path, content = upload
         assert path == f"/repos/{REPOSITORY}/releases/123/assets?name={filename}"
         assert isinstance(content, bytes)
@@ -375,10 +423,9 @@ def test_prepare_then_create_pins_draft_and_both_caller_variants(source, version
 @pytest.mark.parametrize("pin", [
     None, True, "not-an-image", "docker.io/untrusted/image@sha256:" + "b" * 64,
 ])
-def test_create_revalidates_both_prepared_pins_before_remote_access(source, field, pin):
-    api = GitHub()
-    output = source / "prepared"
-    release.prepare(REPOSITORY, REVISION, "refs/heads/main", output, api)
+def test_create_revalidates_both_prepared_pins_before_remote_access(prepared_release, field, pin):
+    """Reject tampered prepared image metadata before any remote call or generated notes."""
+    api, output = prepared_release
     path = output / "metadata.json"
     metadata = json.loads(path.read_text(encoding="utf-8"))
     if pin is None:
@@ -389,31 +436,29 @@ def test_create_revalidates_both_prepared_pins_before_remote_access(source, fiel
     api.calls.clear()
 
     with pytest.raises(ValueError, match="digest-pinned image"):
-        release.create_draft(output, api)
+        release.create_draft(output, api, upload=api)
 
     assert not api.calls
     assert not (output / "release-notes.md").exists()
 
 
-def test_draft_appearing_after_preparation_prevents_creation(source):
-    api = GitHub()
-    output = source / "prepared"
-    release.prepare(REPOSITORY, REVISION, "refs/heads/main", output, api)
+def test_draft_appearing_after_preparation_prevents_creation(prepared_release):
+    """Recheck draft availability at creation time to catch post-preparation races."""
+    api, output = prepared_release
     api.releases[1] = [{"tag_name": "v1.2.3", "draft": True}]
     with pytest.raises(ValueError, match="including drafts"):
-        release.create_draft(output, api)
+        release.create_draft(output, api, upload=api)
     assert not api.writes
     assert not (output / "release-notes.md").exists()
 
 
-def test_draft_creation_failure_after_tag_reservation_propagates_without_cleanup_or_retry(source):
-    api = GitHub()
-    output = source / "prepared"
-    release.prepare(REPOSITORY, REVISION, "refs/heads/main", output, api)
+def test_draft_creation_failure_after_tag_reservation_propagates_without_cleanup_or_retry(prepared_release):
+    """Leave the reserved tag and generated notes intact when draft creation fails."""
+    api, output = prepared_release
     error = http_error(503)
     api.create_error = error
     with pytest.raises(urllib.error.HTTPError) as caught:
-        release.create_draft(output, api)
+        release.create_draft(output, api, upload=api)
     assert caught.value is error
     assert [path for path, _ in api.writes] == [
         f"/repos/{REPOSITORY}/releases/generate-notes",
@@ -424,16 +469,15 @@ def test_draft_creation_failure_after_tag_reservation_propagates_without_cleanup
     assert (output / "release-notes.md").exists()
 
 
-@pytest.mark.parametrize("filename", release.CALLER_FILES)
-def test_missing_local_caller_prevents_all_remote_writes(source, filename):
-    api = GitHub()
-    output = source / "prepared"
-    release.prepare(REPOSITORY, REVISION, "refs/heads/main", output, api)
+@pytest.mark.parametrize("filename", CALLER_FILES)
+def test_missing_local_caller_prevents_all_remote_writes(prepared_release, filename):
+    """Read both validated caller files before making any remote request."""
+    api, output = prepared_release
     (output / filename).unlink()
     api.calls.clear()
 
     with pytest.raises(FileNotFoundError):
-        release.create_draft(output, api)
+        release.create_draft(output, api, upload=api)
 
     assert not api.calls
     assert not (output / "release-notes.md").exists()
@@ -441,14 +485,13 @@ def test_missing_local_caller_prevents_all_remote_writes(source, filename):
 
 @pytest.mark.parametrize("upload_index", [0, 1])
 @pytest.mark.parametrize("error", [http_error(503), urllib.error.URLError("upload disconnected")])
-def test_upload_failure_stops_without_return_retry_cleanup_or_publication(source, upload_index, error):
-    api = GitHub()
-    output = source / "prepared"
-    release.prepare(REPOSITORY, REVISION, "refs/heads/main", output, api)
-    api.upload_errors[release.CALLER_FILES[upload_index]] = error
+def test_upload_failure_stops_without_return_retry_cleanup_or_publication(prepared_release, upload_index, error):
+    """Stop at the failed upload without retrying, cleaning up, or publishing the draft."""
+    api, output = prepared_release
+    api.upload_errors[CALLER_FILES[upload_index]] = error
 
     with pytest.raises(type(error)) as caught:
-        release.create_draft(output, api)
+        release.create_draft(output, api, upload=api)
 
     assert caught.value is error
     assert [path for path, _ in api.writes] == [
@@ -456,12 +499,12 @@ def test_upload_failure_stops_without_return_retry_cleanup_or_publication(source
         f"/repos/{REPOSITORY}/git/refs",
         f"/repos/{REPOSITORY}/releases",
         *(f"/repos/{REPOSITORY}/releases/123/assets?name={filename}"
-          for filename in release.CALLER_FILES[:upload_index + 1]),
+          for filename in CALLER_FILES[:upload_index + 1]),
     ]
     assert api.calls[-1] == api.uploads[-1]
     assert api.writes[2][1]["draft"] is True
     assert (output / "release-notes.md").exists()
-    for filename in release.CALLER_FILES:
+    for filename in CALLER_FILES:
         assert (output / filename).is_file()
 
 
@@ -472,11 +515,10 @@ def test_upload_failure_stops_without_return_retry_cleanup_or_publication(source
     ("state", "starter"), ("name", "wrong.yml"),
     ("size", 0), ("size", 10**9), ("size", "123"),
 ])
-def test_incomplete_or_mismatched_upload_metadata_stops_creation(source, upload_index, field, value):
-    api = GitHub()
-    output = source / "prepared"
-    release.prepare(REPOSITORY, REVISION, "refs/heads/main", output, api)
-    filename = release.CALLER_FILES[upload_index]
+def test_incomplete_or_mismatched_upload_metadata_stops_creation(prepared_release, upload_index, field, value):
+    """Require exact uploaded asset identity and byte count before reporting success."""
+    api, output = prepared_release
+    filename = CALLER_FILES[upload_index]
     response = {"state": "uploaded", "name": filename, "size": (output / filename).stat().st_size}
     if field is None:
         response = {}
@@ -487,14 +529,14 @@ def test_incomplete_or_mismatched_upload_metadata_stops_creation(source, upload_
     api.upload_responses[filename] = response
 
     with pytest.raises(ValueError, match="not uploaded completely"):
-        release.create_draft(output, api)
+        release.create_draft(output, api, upload=api)
 
     assert [path for path, _ in api.writes] == [
         f"/repos/{REPOSITORY}/releases/generate-notes",
         f"/repos/{REPOSITORY}/git/refs",
         f"/repos/{REPOSITORY}/releases",
         *(f"/repos/{REPOSITORY}/releases/123/assets?name={name}"
-          for name in release.CALLER_FILES[:upload_index + 1]),
+          for name in CALLER_FILES[:upload_index + 1]),
     ]
     assert api.calls[-1] == api.uploads[-1]
     assert api.writes[2][1]["draft"] is True
@@ -513,14 +555,13 @@ def test_incomplete_or_mismatched_upload_metadata_stops_creation(source, upload_
     {"id": 123, "draft": "true"},
     {"id": 123, "draft": None},
 ])
-def test_unidentified_or_non_draft_response_is_rejected_before_uploads(source, response):
-    api = GitHub()
-    output = source / "prepared"
-    release.prepare(REPOSITORY, REVISION, "refs/heads/main", output, api)
+def test_unidentified_or_non_draft_response_is_rejected_before_uploads(prepared_release, response):
+    """Upload nothing unless GitHub identifies the newly created release as a draft."""
+    api, output = prepared_release
     api.draft = {**response, "html_url": "https://github.com/example/release"}
 
     with pytest.raises(ValueError):
-        release.create_draft(output, api)
+        release.create_draft(output, api, upload=api)
 
     assert not api.uploads
     assert [path for path, _ in api.writes] == [

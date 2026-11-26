@@ -21,6 +21,7 @@ class RecordedGitHub:
     """Give each API fake independent repository metadata and request history."""
 
     def __init__(self):
+        """Initialize isolated request history and canonical upstream metadata."""
         self.calls = []
         self.repository = {"full_name": REPOSITORY, "default_branch": "main"}
 

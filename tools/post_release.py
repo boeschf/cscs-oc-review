@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Install a published caller and advance VERSION through one maintenance PR.
 
 Read release assets as data, never as executable code. Git Data API writes create
@@ -9,24 +8,19 @@ Reruns consult PR history before checking branch existence or current VERSION.
 import argparse
 import base64
 import binascii
-import re
 import urllib.error
 import urllib.parse
 import urllib.request
 
 import yaml
 
-if __package__:
-    from .caller import version_tag, workflow
-    from .github import github_api
-    from .release import CALLER_FILES, REPOSITORY, SHA
-else:
-    from caller import version_tag, workflow
-    from github import github_api
-    from release import CALLER_FILES, REPOSITORY, SHA
+from common.github import github_api, rest_pages
+from common.identifiers import require_id, require_sha
+
+from .caller import workflow
+from . import release_contract as contract
 
 
-CALLER_PATH = ".github/workflows/cscs-review.yml"
 MAX_CALLER_BYTES = 64 * 1024
 
 
@@ -34,6 +28,7 @@ class HTTPSRedirect(urllib.request.HTTPRedirectHandler):
     """Permit public download redirects only to HTTPS URLs without user info."""
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
+        """Reject redirects that could expose credentials or downgrade transport."""
         target = urllib.parse.urlsplit(newurl)
         if target.scheme != "https" or not target.hostname or target.username or target.password:
             raise ValueError("caller download redirects must use HTTPS without credentials")
@@ -46,22 +41,15 @@ def download_caller(tag):
     GitHub redirects public assets to its storage service. Keep this client
     separate from authenticated API calls and bound the downloaded input size.
     """
-    if not isinstance(tag, str) or not tag.startswith("v") or version_tag(tag[1:]) != tag:
-        raise ValueError("caller download requires a stable release tag")
-    url = f"https://github.com/{REPOSITORY}/releases/download/{tag}/{CALLER_FILES[1]}"
+    contract.version_from_tag(tag)
+    url = (f"https://github.com/{contract.REPOSITORY}/releases/download/{tag}/"
+           f"{contract.WEB_CALLER_ASSET}")
     request = urllib.request.Request(url, headers={"User-Agent": "cscs-oc-review-release"})
     with urllib.request.build_opener(HTTPSRedirect()).open(request, timeout=60) as response:
         content = response.read(MAX_CALLER_BYTES + 1)
     if len(content) > MAX_CALLER_BYTES:
         raise ValueError("release caller exceeds the download size limit")
     return content
-
-
-def _sha(value):
-    """Require the full lowercase object ID used by GitHub.com Git APIs."""
-    if not isinstance(value, str) or not SHA.fullmatch(value):
-        raise ValueError("GitHub object must have a full commit/object SHA")
-    return value
 
 
 def _optional(api, path):
@@ -95,7 +83,7 @@ def _tag_commit(api, base, tag):
     obj = api(f"{base}/git/ref/tags/{tag}")["object"]
     seen = set()
     while True:
-        revision = _sha(obj["sha"])
+        revision = require_sha(obj["sha"])
         if obj.get("type") == "commit":
             return revision
         if obj.get("type") != "tag" or revision in seen:
@@ -124,34 +112,26 @@ def _caller_revision(content):
     try:
         document = yaml.safe_load(content.decode("utf-8"))
         reference = document["jobs"]["review"]["uses"]
-        pattern = re.escape(REPOSITORY + "/.github/workflows/review.yml@") + r"([0-9a-f]{40})"
-        match = re.fullmatch(pattern, reference)
-        if match is None:
+        upstream, separator, revision = reference.rpartition("@")
+        if upstream != contract.REVIEW_WORKFLOW or not separator:
             raise ValueError("caller must pin the upstream review workflow to a full SHA")
-        revision = match[1]
+        require_sha(revision, field="caller revision")
         if document != yaml.safe_load(workflow(revision, allow_web=True)):
             raise ValueError("caller must be the standard web-enabled workflow without custom inputs")
         return revision
-    except (UnicodeError, yaml.YAMLError, KeyError, TypeError) as error:
+    except (UnicodeError, yaml.YAMLError, AttributeError, KeyError, TypeError) as error:
         raise ValueError("caller must be valid UTF-8 YAML with a pinned web-enabled review job") from error
 
 
 def _previous_pr(api, base, branch):
     """Find all matching PR history, including merged PRs whose branch was deleted."""
-    owner = REPOSITORY.split("/")[0]
+    owner = contract.REPOSITORY.split("/")[0]
     matches = []
-    page = 1
-    while True:
-        query = urllib.parse.urlencode({"state": "all", "head": f"{owner}:{branch}",
-                                        "per_page": 100, "page": page})
-        pulls = api(f"{base}/pulls?{query}")
-        if not isinstance(pulls, list):
-            raise ValueError("malformed maintenance PR history")
+    for pulls in rest_pages(
+        api, f"{base}/pulls", params={"state": "all", "head": f"{owner}:{branch}"},
+    ):
         matches.extend(pr for pr in pulls if pr.get("head", {}).get("ref") == branch
-                       and (pr["head"].get("repo") or {}).get("full_name") == REPOSITORY)
-        if len(pulls) < 100:
-            break
-        page += 1
+                       and (pr["head"].get("repo") or {}).get("full_name") == contract.REPOSITORY)
     if len(matches) > 1:
         raise ValueError("multiple maintenance PRs exist for this release; inspect their history")
     return matches[0] if matches else None
@@ -159,10 +139,8 @@ def _previous_pr(api, base, branch):
 
 def _result(state, pr, tag):
     """Build a summary link from the upstream PR number, not an API-supplied URL."""
-    number = pr.get("number")
-    if type(number) is not int or number <= 0:
-        raise ValueError("GitHub did not return an identified maintenance PR")
-    return {"state": state, "url": f"https://github.com/{REPOSITORY}/pull/{number}", "tag": tag}
+    number = require_id(pr.get("number"), field="maintenance PR number")
+    return {"state": state, "url": f"https://github.com/{contract.REPOSITORY}/pull/{number}", "tag": tag}
 
 
 def _resume_branch(api, base, revision, parent, updates, changed):
@@ -181,20 +159,23 @@ def _resume_branch(api, base, revision, parent, updates, changed):
 
 
 def _create_branch(api, base, branch, parent, updates, tag):
-    """Create one two-file commit and a new ref; never update or force-push a ref."""
-    tree = _sha(api(f"{base}/git/commits/{parent}")["tree"]["sha"])
+    """Commit the planned files on a new ref; never update or force-push a ref.
+
+    Only VERSION differs when the installed caller already matches the asset.
+    """
+    tree = require_sha(api(f"{base}/git/commits/{parent}")["tree"]["sha"])
     entries = []
     for path, content in updates.items():
         blob = api(f"{base}/git/blobs", {
             "encoding": "base64", "content": base64.b64encode(content).decode("ascii"),
         })
-        entries.append({"path": path, "mode": "100644", "type": "blob", "sha": _sha(blob["sha"])})
-    tree = _sha(api(f"{base}/git/trees", {"base_tree": tree, "tree": entries})["sha"])
+        entries.append({"path": path, "mode": "100644", "type": "blob", "sha": require_sha(blob["sha"])})
+    tree = require_sha(api(f"{base}/git/trees", {"base_tree": tree, "tree": entries})["sha"])
     # GitHub uses the authenticated App bot as author and committer by default.
     commit = api(f"{base}/git/commits", {
         "message": f"Prepare development after {tag}", "tree": tree, "parents": [parent],
     })
-    api(f"{base}/git/refs", {"ref": "refs/heads/" + branch, "sha": _sha(commit["sha"])})
+    api(f"{base}/git/refs", {"ref": "refs/heads/" + branch, "sha": require_sha(commit["sha"])})
 
 
 def prepare(repository, release_id, *, api=github_api, download=download_caller):
@@ -204,11 +185,12 @@ def prepare(repository, release_id, *, api=github_api, download=download_caller)
     ancestry, and a canonical web caller. Resolve all conflicts before creating a
     branch. Failures can leave an orphan branch, which a rerun checks before reuse.
     """
-    if repository != REPOSITORY or type(release_id) is not int or release_id <= 0:
-        raise ValueError("post-release preparation requires upstream and a positive release ID")
+    if repository != contract.REPOSITORY:
+        raise ValueError("post-release preparation requires upstream")
+    require_id(release_id, field="release ID")
     base = f"/repos/{repository}"
     source = api(base)
-    if source.get("full_name") != REPOSITORY or not source.get("default_branch"):
+    if source.get("full_name") != contract.REPOSITORY or not source.get("default_branch"):
         raise ValueError("post-release preparation requires the upstream default branch")
     default_branch = source["default_branch"]
     release = api(f"{base}/releases/{release_id}")
@@ -216,9 +198,7 @@ def prepare(repository, release_id, *, api=github_api, download=download_caller)
             or release.get("prerelease") is not False or not release.get("published_at")):
         raise ValueError("post-release preparation requires a published stable release")
     tag = release["tag_name"]
-    if not isinstance(tag, str) or not tag.startswith("v") or version_tag(tag[1:]) != tag:
-        raise ValueError("release tag must be vMAJOR.MINOR.PATCH")
-    version = tag[1:]
+    version = contract.version_from_tag(tag)
     branch = f"maintenance/post-release-{tag}"
     previous = _previous_pr(api, base, branch)
     if previous is not None:
@@ -234,7 +214,7 @@ def prepare(repository, release_id, *, api=github_api, download=download_caller)
 
     released = _tag_commit(api, base, tag)
     default_ref = f"{base}/git/ref/heads/{urllib.parse.quote(default_branch, safe='/')}"
-    head = _sha(api(default_ref)["object"]["sha"])
+    head = require_sha(api(default_ref)["object"]["sha"])
     _ancestor(api, base, released, head)
     released_version = _file(api, base, "VERSION", released)
     if released_version.decode("utf-8").strip() != version:
@@ -247,18 +227,18 @@ def prepare(repository, release_id, *, api=github_api, download=download_caller)
     caller = download(tag)
     if _caller_revision(caller) != released:
         raise ValueError("release caller does not pin the released commit")
-    existing = _file(api, base, CALLER_PATH, head, optional=True)
+    existing = _file(api, base, contract.CALLER_PATH, head, optional=True)
     if existing is not None:
         _ancestor(api, base, _caller_revision(existing), released)
-    updates = {"VERSION": (next_version + "\n").encode("utf-8"), CALLER_PATH: caller}
+    updates = {"VERSION": (next_version + "\n").encode("utf-8"), contract.CALLER_PATH: caller}
     changed = {path for path, content in updates.items()
                if content != (current_version if path == "VERSION" else existing)}
     branch_ref = f"{base}/git/ref/heads/{branch}"
     orphan = _optional(api, branch_ref)
     if orphan is not None:
-        _resume_branch(api, base, _sha(orphan["object"]["sha"]), head, updates, changed)
+        _resume_branch(api, base, require_sha(orphan["object"]["sha"]), head, updates, changed)
     # Recheck before writing in case another release or maintainer advanced the default branch.
-    if _sha(api(default_ref)["object"]["sha"]) != head:
+    if require_sha(api(default_ref)["object"]["sha"]) != head:
         raise ValueError("default branch advanced during preparation; rerun against its current state")
     if orphan is None:
         _create_branch(api, base, branch, head, updates, tag)
@@ -268,7 +248,7 @@ def prepare(repository, release_id, *, api=github_api, download=download_caller)
         "body": (
             f"## Post-release maintenance\n\n"
             f"- Release: [{tag}](https://github.com/{repository}/releases/tag/{tag}).\n"
-            f"- Install the unchanged `{CALLER_FILES[1]}` asset as `{CALLER_PATH}`.\n"
+            f"- Install the unchanged `{contract.WEB_CALLER_ASSET}` asset as `{contract.CALLER_PATH}`.\n"
             f"- Pin the reviewer to `{released}` with web search and fetch enabled.\n"
             f"- Advance `VERSION` from `{version}` to `{next_version}` for the next development cycle.\n\n"
             "Web queries and fetched URLs can disclose repository details outside CSCS.\n"

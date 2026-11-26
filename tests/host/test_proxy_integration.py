@@ -12,6 +12,8 @@ import uuid
 
 import pytest
 
+from host import credential_proxy, extract
+
 
 ROOT = Path(__file__).resolve().parents[2]
 ENGINE = os.environ.get("REVIEW_CONTAINER_TEST_ENGINE")
@@ -23,7 +25,6 @@ _CANARY = "fixture-upstream-canary-not-a-real-key"
 def runtime(tmp_path, monkeypatch, runner):
     """Use production proxy configuration with a test-only CA and HTTPS upstream."""
     import yaml
-    import credential_proxy
 
     engine = shutil.which(ENGINE)
     if not engine:
@@ -39,7 +40,7 @@ def runtime(tmp_path, monkeypatch, runner):
     fixture = tmp_path / "provider"
     fixture.mkdir(mode=0o777)
     fixture.chmod(0o777)
-    shutil.copyfile(Path(__file__).with_name("proxy_provider.mjs"), fixture / "server.mjs")
+    shutil.copyfile(Path(__file__).parent / "fixtures" / "proxy_provider.mjs", fixture / "server.mjs")
     subprocess.run([
         "openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
         "-subj", "/CN=provider", "-addext", "subjectAltName=DNS:provider",
@@ -51,6 +52,7 @@ def runtime(tmp_path, monkeypatch, runner):
     launched = []
 
     def run(self, arguments, **kwargs):
+        """Trust the fixture CA and start a keyed provider on the isolated per-run network."""
         if arguments[0] == "run" and self.image in arguments:
             index = arguments.index(self.image)
             arguments = [*arguments[:index], "--env=SSL_CERT_FILE=/etc/caddy/test-ca.pem",
@@ -71,9 +73,11 @@ def runtime(tmp_path, monkeypatch, runner):
             control(self, ["exec", self.network + "-provider", "node", "-e", """
 const https = require('node:https');
 const deadline = Date.now() + 5000;
+// Retry provider readiness only until the fixture startup deadline.
 function ready() {
   const request = https.get('https://127.0.0.1:9443/requests',
-    {rejectUnauthorized:false}, response => response.resume());
+    {rejectUnauthorized:false}, /* Drain the readiness response. */ response => response.resume());
+  // Retry connection failures while startup time remains.
   request.on('error', () => {
     if (Date.now() >= deadline) process.exit(1);
     else setTimeout(ready, 20);
@@ -104,12 +108,13 @@ def client(runtime, proxy, script):
 
 
 def records(runtime):
+    """Read the provider observation ledger, treating no received requests as an empty list."""
     path = runtime["fixture"] / "requests.jsonl"
     return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
 
 
 def test_proxy_authentication_routes_streaming_and_large_requests(runtime, tmp_path):
-    import credential_proxy
+    """Assert proxy access controls, streaming, body integrity, and upstream cancellation independently."""
 
     proxy = credential_proxy.CredentialProxy(
         runtime["engine"], runtime["proxy_image"], uuid.uuid4().hex, tmp_path,
@@ -128,14 +133,17 @@ const http = require('node:http');
 const https = require('node:https');
 const crypto = require('node:crypto');
 const token = TOKEN;
+// Send a probe through the proxy and return its complete streamed response.
 async function request(path, body, authorization = `Bearer ${token}`, method = 'POST') {
+  // Resolve after the response ends; reject transport failures.
   return new Promise((resolve, reject) => {
     const req = http.request({host:'credential-proxy',port:8080,path,method,
       headers:{Authorization:authorization,'Content-Type':'application/json',
         'X-Api-Key':'untrusted-client-key','Proxy-Authorization':'untrusted-client-key',
-        Host:'untrusted.invalid'}}, response => {
+        Host:'untrusted.invalid'}}, /* Collect the proxied status and body. */ response => {
       const chunks = [];
       let released = false;
+      // Release the upstream only after observing its first streamed content.
       response.on('data', chunk => {
         chunks.push(chunk);
         if (!released && body?.includes('"probe":"stream"')
@@ -143,16 +151,19 @@ async function request(path, body, authorization = `Bearer ${token}`, method = '
           released = true;
           // The provider cannot finish until the client receives its first content chunk.
           https.get('https://provider:9443/release', {rejectUnauthorized:false},
-            response => response.resume()).on('error', reject);
+            /* Drain the provider release acknowledgment. */ response => response.resume()).on('error', reject);
         }
       });
+      // Preserve the exact status and reassembled bytes for host assertions.
       response.on('end', () => resolve({status:response.statusCode, body:Buffer.concat(chunks).toString()}));
     });
     req.on('error', reject);
+    // Fail stalled probes instead of leaving a client container running.
     req.setTimeout(5000, () => req.destroy(new Error('proxy response timed out')));
     req.end(body);
   });
 }
+// Exercise authentication, route, method, error, and large-stream boundaries.
 (async () => {
   const bad = await request('/v1/chat/completions','{}','Bearer invalid');
   const route = await request('/debug','{}');
@@ -162,7 +173,7 @@ async function request(path, body, authorization = `Bearer ${token}`, method = '
   const stream = await request('/v1/chat/completions?ignored=true',body);
   console.log(JSON.stringify({bad:bad.status,route:route.status,method:method.status,
     error,stream,digest:crypto.createHash('sha256').update(body).digest('hex'),bytes:Buffer.byteLength(body)}));
-})().catch(error => { console.error(error); process.exit(1); });
+})().catch(/* Surface client failures as a nonzero fixture exit. */ error => { console.error(error); process.exit(1); });
 '''.replace("TOKEN", json.dumps(proxy.token)))
         assert (result["bad"], result["route"], result["method"]) == (401, 404, 404)
         assert result["error"] == {"status": 429, "body": '{"error":"fixture rate limit"}'}
@@ -178,30 +189,41 @@ async function request(path, body, authorization = `Bearer ${token}`, method = '
 const http = require('node:http');
 const https = require('node:https');
 const token = TOKEN;
+// Read upstream observations directly, bypassing the proxy under test.
 async function providerLog() {
+  // Resolve only after the complete provider ledger has arrived.
   return new Promise((resolve,reject) => {
+    // Collect the ledger response without interpreting individual records yet.
     https.get('https://provider:9443/requests', {rejectUnauthorized:false}, response => {
-      let body = ''; response.on('data', chunk => {body += chunk;});
+      let body = '';
+      // Accumulate every ledger chunk before resolving the read.
+      response.on('data', chunk => {body += chunk;});
+      // Return the complete observation text for cancellation polling.
       response.on('end', () => resolve(body));
     }).on('error',reject);
   });
 }
+// Disconnect after the first chunk and require cancellation to reach the provider.
 (async () => {
+  // Resolve after deliberately closing the downstream stream.
   await new Promise((resolve,reject) => {
     const request = http.request({host:'credential-proxy',port:8080,path:'/v1/chat/completions',
       method:'POST',headers:{Authorization:`Bearer ${token}`,'Content-Type':'application/json'}},
-      response => response.once('data', () => {response.destroy();resolve();}));
+      /* Wait for a response before registering the disconnect probe. */ response => response.once(
+        'data', /* Cancel immediately after the first upstream chunk. */ () => {response.destroy();resolve();}));
     request.on('error',reject);
+    // Bound the wait for the first chunk independently of upstream cancellation.
     request.setTimeout(5000, () => request.destroy(new Error('missing initial stream chunk')));
     request.end(JSON.stringify({probe:'stall'}));
   });
   const deadline = Date.now() + 3000;
   while (!(await providerLog()).includes('"aborted":true')) {
     if (Date.now() >= deadline) throw new Error('upstream was not cancelled');
+    // Yield between ledger reads without changing the cancellation deadline.
     await new Promise(resolve => setTimeout(resolve,20));
   }
   console.log(JSON.stringify({cancelled:true}));
-})().catch(error => {console.error(error);process.exit(1);});
+})().catch(/* Fail the fixture on transport or cancellation errors. */ error => {console.error(error);process.exit(1);});
 '''.replace("TOKEN", json.dumps(proxy.token)))
         assert aborted["cancelled"]
     finally:
@@ -209,24 +231,23 @@ async function providerLog() {
 
 
 def test_review_phases_use_proxy_without_exposing_credentials(
-        runtime, runner, checkout, trusted_runner, tmp_path, monkeypatch):
-    _, instructions = trusted_runner
-    config = tmp_path / "config"
-    config.mkdir()
-    shutil.copyfile(ROOT / "config/opencode.json", config / "opencode.json")
-    (config / "credential-proxy.json").write_text(json.dumps(runtime["policy"]))
-    (config / "limits.json").write_text(json.dumps({
-        "inspection_seconds": 20, "finalization_seconds": 10,
-        "execution_overhead_seconds": 15, "termination_grace_seconds": 1,
-    }))
-    context = tmp_path / "context.md"
+        runtime, runner, review_inputs, config_factory, monkeypatch):
+    """Exercise both review phases while proving credential separation and readonly source access."""
+    checkout = review_inputs["checkout"]
+    config = config_factory(
+        name="config", opencode=(ROOT / "config/opencode.json").read_bytes(),
+        policy=runtime["policy"],
+        limits={"inspection_seconds": 20, "finalization_seconds": 10,
+                "execution_overhead_seconds": 15, "termination_grace_seconds": 1},
+    )
+    context = review_inputs["context"]
     context.write_text("Review the single app.py file in this fixture PR.\n")
-    events = tmp_path / "events.jsonl"
+    events = review_inputs["events"]
     monkeypatch.setenv("CSCS_INFERENCE_KEY", _CANARY)
     monkeypatch.setenv("GITHUB_TOKEN", "fixture-host-github-token")
-    runner.run_review(runtime["engine"], runtime["image"], checkout, context, events,
-                      instructions, config, runtime["proxy_image"])
-    import extract
+    runner.run_review(engine=runtime["engine"], image=runtime["image"],
+                      proxy_image=runtime["proxy_image"],
+                      **(review_inputs | {"config_dir": config}))
     with events.open() as lines:
         review = extract.extract_review(lines)
     assert "Credential proxy fixture review." in review
@@ -238,7 +259,6 @@ def test_review_phases_use_proxy_without_exposing_credentials(
     inspection = [request for request in requests if not request.get("final")]
     assert inspection[0]["max_tokens"] == 16384 and inspection[0]["reasoning_effort"] == "high"
     messages = json.dumps(final[-1]["messages"])
-    assert "PROXY_BOUNDARY:" in messages
     # Parse the probe result from tool output; the source stays immutable even with a shell.
     match = re.search(r"PROXY_BOUNDARY:([A-Za-z0-9+/]+=*)", messages)
     assert match, messages

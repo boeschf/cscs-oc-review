@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Render subscriber workflow YAML pinned to a full upstream commit SHA.
 
 The optional source version is a comment, not the executable reference.
@@ -7,17 +6,9 @@ Generation does not install files or call GitHub.
 
 import argparse
 import json
-import re
+from common.identifiers import require_sha
 
-
-def version_tag(version):
-    """Return vMAJOR.MINOR.PATCH; raise ValueError for other version formats.
-
-    Reject prefixes, leading zeros, prerelease suffixes, and build metadata.
-    """
-    if not re.fullmatch(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)", version, re.ASCII):
-        raise ValueError("release version must be MAJOR.MINOR.PATCH without a leading v")
-    return "v" + version
+from . import release_contract as contract
 
 
 def workflow(
@@ -34,13 +25,12 @@ def workflow(
     literal; the runner validates its location and contents. allow_web opts into
     external search/fetch tools. Forward only CSCS_INFERENCE_KEY.
     """
-    if not re.fullmatch(r"[0-9a-f]{40}", revision):
-        raise ValueError("revision must be a full lowercase commit SHA")
+    require_sha(revision, field="revision")
     if review_instructions_path and (
         not review_instructions_path.isprintable() or "${{" in review_instructions_path
     ):
         raise ValueError("review instruction path must be a printable literal without GitHub expressions")
-    version_comment = "" if release_version is None else " # " + version_tag(release_version)
+    version_comment = "" if release_version is None else " # " + contract.version_tag(release_version)
     lines = [
         "name: CSCS review",
         "",
@@ -56,7 +46,7 @@ def workflow(
         "jobs:",
         "  review:",
         "    # Central authorization runs before per-PR cancellation or inference.",
-        f"    uses: eth-cscs/cscs-oc-review/.github/workflows/review.yml@{revision}{version_comment}",
+        f"    uses: {contract.REVIEW_WORKFLOW}@{revision}{version_comment}",
     ]
     if allow_web or review_instructions_path:
         lines.append("    with:")

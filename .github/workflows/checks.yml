@@ -23,18 +23,18 @@ jobs:
         # Lint this repository's workflows with the shared, verified actionlint installation.
         run: actionlint -color
 
-      - name: Host and release tooling tests
+      - name: Shared, host, and release tooling tests
         # Local fixtures and a simulated GitHub API; no inference or release credentials.
-        run: uv run --with pytest --with pyyaml pytest host/tests tools/tests
+        run: uv run --with pytest --with pyyaml python -m pytest tests
 
       - name: Credential proxy Docker integration tests
         # Local deterministic upstream only; no real inference or credentials.
         env:
           REVIEW_CONTAINER_TEST_ENGINE: docker
-        run: uv run --with pytest --with pyyaml pytest -q host/tests/test_proxy_integration.py
+        run: uv run --with pytest --with pyyaml python -m pytest -q tests/host/test_proxy_integration.py
 
       - name: Review runtime tests
-        run: node --test image/test-run-review.mjs
+        run: node --test tests/runtime/test-run-review.mjs
 
       - name: Shell syntax
         run: git ls-files '*.sh' | xargs -r -n1 bash -n

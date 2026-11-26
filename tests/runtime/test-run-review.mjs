@@ -6,10 +6,12 @@ import { delimiter, join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import test from 'node:test';
 
-const runner = new URL('./run-review.mjs', import.meta.url);
+const runner = new URL('../../image/run-review.mjs', import.meta.url);
 
+// Run the real phase coordinator against a disposable adversarial CLI and input tree.
 function exercise(t, scenario) {
   const root = mkdtempSync(join(tmpdir(), 'review-phases-'));
+  // Remove fixture files after assertions, including when the scenario fails.
   t.after(() => rmSync(root, { recursive: true, force: true }));
   const bin = join(root, 'bin');
   mkdirSync(bin);
@@ -34,8 +36,12 @@ function exercise(t, scenario) {
   const sourcePath = join(input, 'pr-source', 'reviewed.txt');
   writeFileSync(contextPath, context, { mode: 0o400 });
   writeFileSync(sourcePath, source, { mode: 0o400 });
+  // Hash raw input bytes so evidence cannot pass by echoing the prompt.
   const digest = bytes => createHash('sha256').update(bytes).digest('hex');
-  const expected = { contextBytes: context.length, contextHash: digest(context), sourceHash: digest(source) };
+  const expected = {
+    contextBytes: context.length, contextHash: digest(context),
+    sourceBytes: source.length, sourceHash: digest(source),
+  };
   writeFileSync(join(root, 'opencode', 'limits.json'), JSON.stringify({
     inspection_seconds: 0.8, finalization_seconds: 0.8,
     execution_overhead_seconds: 0.3, termination_grace_seconds: 0.05,
@@ -50,6 +56,7 @@ const args = process.argv.slice(2);
 const final = args[args.indexOf('--agent') + 1] === 'review-finalizer';
 const scenario = process.env.SCENARIO;
 appendFileSync(process.env.CALLS, final ? 'final\\n' : 'inspection\\n');
+// Map only the mounted paths advertised to the runner into this isolated fixture.
 const inputPath = path => {
   assert.ok(path === '/input/context.md' || path === '/input/pr-source/reviewed.txt');
   return join(process.env.FIXTURE_INPUT, path.slice('/input/'.length));
@@ -69,7 +76,7 @@ const boundedRead = path => {
   const buffer = Buffer.alloc(4096);
   const hash = createHash('sha256');
   const sections = new Set();
-  let bytes = 0, reads = 0, maxRead = 0, tail = '';
+  let bytes = 0, tail = '';
   try {
     for (;;) {
       const count = readSync(fd, buffer, 0, buffer.length, bytes);
@@ -81,20 +88,23 @@ const boundedRead = path => {
       }
       tail = text.slice(-64);
       bytes += count;
-      reads++;
-      maxRead = Math.max(maxRead, count);
     }
   } finally {
     closeSync(fd);
   }
-  return { bytes, reads, maxRead, sha256: hash.digest('hex'), sections: [...sections] };
+  return { bytes, sha256: hash.digest('hex'), sections: [...sections] };
 };
+// Keep the CLI alive despite graceful termination to exercise forced group cleanup.
 const stall = async () => {
+  // Ignore SIGTERM and retain an active timer while the scenario waits indefinitely.
   process.on('SIGTERM', () => {});
   setInterval(() => {}, 1000);
+  // Never resolve: only the runner's deadline and forced kill may end this stall.
   await new Promise(() => {});
 };
+// Emit the same line-delimited JSON protocol consumed from the real CLI.
 const emit = event => console.log(JSON.stringify(event));
+// Build a session-bound event, allowing scenarios to override protocol fields.
 const event = (type, extra = {}) => ({
   type, sessionID: 'session-review', ...extra,
   part: { id: 'text', messageID: final ? 'final' : 'inspection',
@@ -120,7 +130,9 @@ if (!final && scenario === 'cancel') {
   // A CLI can exit cleanly while handling cancellation; that must not authorize finalization.
   process.once('SIGTERM', () => process.exit(0));
   process.kill(process.ppid, 'SIGTERM');
+  // Bound fixture lifetime if the runner fails to forward its cancellation signal.
   setTimeout(() => process.exit(8), 2000);
+  // Wait for cancellation or the fixture's emergency exit, not normal phase completion.
   await new Promise(() => {});
 }
 if ((!final && scenario === 'inspection-error') || (final && scenario === 'final-error')) {
@@ -168,16 +180,10 @@ catch (error) { console.error(error.message); process.exitCode = error.exitCode 
   const result = spawnSync(process.execPath, [harness], { env, encoding: 'utf8', timeout: 10000 });
   assert.ifError(result.error);
   const events = result.stdout.trim().split('\n').filter(Boolean).map(line => JSON.parse(line));
-  let attachmentResult;
-  if (scenario === 'large-context') {
-    attachmentResult = spawnSync(process.execPath, [
-      join(bin, 'opencode'), 'run', '--agent', 'grumpy-reviewer', '--file', '/input/context.md', 'Inspect',
-    ], { env: { ...env, CALLS: join(root, 'attachment-calls') }, encoding: 'utf8', timeout: 10000 });
-    assert.ifError(attachmentResult.error);
-  }
   return {
-    ...result, events, calls: readFileSync(calls, 'utf8').trim().split('\n'), expected, attachmentResult,
+    ...result, events, calls: readFileSync(calls, 'utf8').trim().split('\n'), expected,
     contextHashAfter: digest(readFileSync(contextPath)),
+    sourceHashAfter: digest(readFileSync(sourcePath)),
   };
 }
 
@@ -212,25 +218,18 @@ test('a failed tool does not block finalization after successful inspection', t 
 test('context beyond the attachment limit remains accessible to inspection and finalization', t => {
   const result = exercise(t, 'large-context');
   assert.ok(result.expected.contextBytes > 10 * 1024 * 1024);
-  assert.notEqual(result.attachmentResult.status, 0);
-  const rejection = JSON.parse(result.attachmentResult.stdout);
-  assert.equal(rejection.type, 'error');
-  assert.equal(rejection.sessionID, '');
-  assert.match(rejection.error.message, /larger than 10 MiB/);
-
   assert.equal(result.status, 0, result.stderr);
   assert.deepEqual(result.calls, ['inspection', 'final']);
   assert.equal(result.contextHashAfter, result.expected.contextHash, 'the complete context stays unchanged on disk');
+  assert.equal(result.sourceHashAfter, result.expected.sourceHash, 'the source stays unchanged on disk');
   const evidence = JSON.parse(result.events.find(event => event.type === 'tool_use').part.state.output);
   assert.equal(evidence.context.bytes, result.expected.contextBytes);
   assert.equal(evidence.context.sha256, result.expected.contextHash);
-  assert.ok(evidence.context.reads > 2500);
-  assert.equal(evidence.context.maxRead, 4096);
   assert.deepEqual(evidence.context.sections, [
     '## Metadata', '## Review history', '## Full merge-base diff', '+diff-tail-',
   ]);
   assert.equal(evidence.source.sha256, result.expected.sourceHash);
-  assert.ok(evidence.source.bytes > 0 && evidence.source.maxRead <= 4096);
+  assert.equal(evidence.source.bytes, result.expected.sourceBytes);
   const finalStart = result.events.findIndex(event =>
     event.type === 'review_phase' && event.phase === 'final' && event.state === 'start');
   assert.ok(finalStart >= 0);

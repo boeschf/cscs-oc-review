@@ -54,11 +54,13 @@ jobs:
       # Missing collaborators are rejected; other API failures stop authorization.
       - name: Check current repository write access
         id: access
+        # Import helpers only from the pinned trusted checkout, never the PR source.
+        working-directory: reviewer-source
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          python3 reviewer-source/host/context.py authorize \
+          python3 -m host.context authorize \
             --event-name "$GITHUB_EVENT_NAME" \
             --event-path "$GITHUB_EVENT_PATH" \
             --repository "$GITHUB_REPOSITORY" \

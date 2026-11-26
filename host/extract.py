@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Extract the final assistant message from native OpenCode v2 JSONL output."""
 
 import argparse
@@ -14,6 +13,7 @@ _INCOMPLETE_NOTICE = (
 
 
 def extract_review(lines):
+    """Accept only a complete parent final response and qualify interrupted inspection."""
     phase = "initial"
     session = None
     message = None
@@ -99,6 +99,7 @@ def extract_review(lines):
 
 
 def main(argv=None):
+    """Extract into a separate output file, preserving artifacts on invalid events."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--events", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)

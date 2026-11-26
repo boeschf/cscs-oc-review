@@ -3,9 +3,11 @@ import https from 'node:https';
 import fs from 'node:fs';
 import crypto from 'node:crypto';
 
+// Record upstream observations without storing request authentication.
 const log = event => fs.appendFileSync('/fixture/requests.jsonl', JSON.stringify(event) + '\n');
 let inspected = false;
 let releaseStream;
+// Serve control endpoints or emit the requested deterministic inference stream.
 const server = https.createServer({
   key: fs.readFileSync('/fixture/key.pem'), cert: fs.readFileSync('/fixture/cert.pem'),
 }, async (request, response) => {
@@ -37,6 +39,7 @@ const server = https.createServer({
   }
   response.writeHead(200, {'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache'});
   response.flushHeaders();
+  // Encode one OpenAI-compatible streaming delta.
   const event = (delta, finish = null) => response.write(`data: ${JSON.stringify({
     id: 'fixture', object: 'chat.completion.chunk', created: 1, model: body.model,
     choices: [{index: 0, delta, finish_reason: finish}],
@@ -45,9 +48,11 @@ const server = https.createServer({
   if (body.probe) {
     event({content: 'first'});
     if (body.probe === 'stall') {
+      // Expose upstream cancellation when the downstream client disconnects.
       response.on('close', () => log({aborted: true}));
       return;
     }
+    // Hold the second chunk until the client observes and releases the first.
     await new Promise(resolve => { releaseStream = resolve; });
     event({content: 'second'}, 'stop');
   } else if (!inspected && body.tool_choice !== 'none') {

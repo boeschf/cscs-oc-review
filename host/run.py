@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Run the trusted reviewer without exposing host credentials or writable source."""
 
 import argparse
@@ -18,12 +17,14 @@ import time
 import uuid
 from urllib.parse import quote, quote_plus
 
-from context import git, worktree_root
-from extract import EVENT_TYPES
-from credential_proxy import CredentialProxy, load_policy
+from host.context import git, worktree_root
+from host.extract import EVENT_TYPES
+from host.credential_proxy import CredentialProxy, load_policy
+from host.container_policy import BASELINE_FLAGS
 
 
-_PROGRESS_INTERVAL = 30
+# Reporting cadence only; this does not impose a command or execution deadline.
+_PROGRESS_REPORT_INTERVAL_SECONDS = 30
 _FINISH_REASONS = {"stop", "end_turn", "length", "tool-calls", "content-filter", "error", "unknown"}
 _TOOL_NAMES = {"execute", "glob", "grep", "question", "read", "shell",
                "skill", "subagent", "webfetch", "websearch"}
@@ -41,6 +42,7 @@ _URL_CREDENTIALS = re.compile(r"(?i)(https?://)[^/\s?#]*@")
 
 
 def _redact_error_text(text, secrets):
+    """Remove known and credential-shaped secrets before normalizing public error text."""
     if not isinstance(text, str):
         return ""
     # Redact before truncation so a credential crossing the excerpt boundary
@@ -54,6 +56,7 @@ def _redact_error_text(text, secrets):
 
 
 def _error_detail(error, phase, secrets):
+    """Keep bounded, redacted error details and only explicitly reported timeout evidence."""
     error = error if isinstance(error, dict) else {}
     kind = _redact_error_text(error.get("type"), secrets)[:80] or "unknown"
     message = _redact_error_text(error.get("message"), secrets)
@@ -82,6 +85,7 @@ def _error_detail(error, phase, secrets):
 
 
 def _tool_result(part):
+    """Summarize allowlisted tool states, including failures reported as completed."""
     if not isinstance(part, dict):
         return "other/other"
     name = part.get("tool")
@@ -102,6 +106,7 @@ def _tool_result(part):
 
 
 def _report_progress(output, stopped, started, diagnostic=None, private_values=()):
+    """Report fixed-label progress periodically and collect bounded private diagnostics."""
     previous = 0
     counts = Counter()
     tool_counts = Counter()
@@ -122,7 +127,7 @@ def _report_progress(output, stopped, started, diagnostic=None, private_values=(
     # A separate descriptor keeps reads from moving the container's stdout write position.
     with open(output.name, "rb") as events:
         while True:
-            finished = stopped.wait(_PROGRESS_INTERVAL)
+            finished = stopped.wait(_PROGRESS_REPORT_INTERVAL_SECONDS)
             # Bound each scan so a busy producer cannot delay cancellation.
             size = os.stat(output.name).st_size
             while events.tell() < size:
@@ -203,6 +208,7 @@ def _stop_process(process, grace):
 
 
 def _write_diagnostic(path, diagnostic):
+    """Persist diagnostics in an owner-private artifact, never the public log."""
     with path.open("w", encoding="utf-8") as output:
         os.fchmod(output.fileno(), 0o600)
         json.dump(diagnostic, output, sort_keys=True)
@@ -211,11 +217,22 @@ def _write_diagnostic(path, diagnostic):
 
 
 def checkout_state(checkout):
+    """Snapshot HEAD and all worktree changes for the post-cleanup integrity check."""
     return (git(checkout, "rev-parse", "--verify", "HEAD"),
             git(checkout, "status", "--porcelain=v1", "--untracked-files=all"))
 
 
+def _validate_artifact_paths(checkout, inputs, artifacts):
+    """Reject resolved artifact paths that overwrite source, inputs, or each other."""
+    seen = set()
+    for name, path in artifacts.items():
+        if path == checkout or checkout in path.parents or path in inputs or path in seen:
+            raise ValueError(f"{name} output must not overwrite the checkout, review inputs, or other artifacts")
+        seen.add(path)
+
+
 def run_review(engine, image, checkout, context, events, instructions, config_dir, proxy_image):
+    """Run credential-separated review with readonly inputs and cleanup-before-integrity checks."""
     checkout = worktree_root(checkout)
     context = Path(context).resolve(strict=True)
     events = Path(events).resolve()
@@ -249,16 +266,11 @@ def run_review(engine, image, checkout, context, events, instructions, config_di
     inputs = {context, instructions, *config_paths.values()}
     if not context.is_file():
         raise ValueError("context must be a file")
-    if events == checkout or checkout in events.parents or events in inputs:
-        raise ValueError("events output must not overwrite the checkout, context, instructions, or configuration")
     diagnostics = events.with_suffix(".diagnostics.json").resolve()
-    if (diagnostics == events or diagnostics == checkout or checkout in diagnostics.parents
-            or diagnostics in inputs):
-        raise ValueError("diagnostics output must not overwrite review inputs or events")
     stderr = events.with_suffix(".stderr.log").resolve()
-    if (stderr == checkout or checkout in stderr.parents
-            or stderr in inputs or stderr in (events, diagnostics)):
-        raise ValueError("stderr output must not overwrite review inputs, events or diagnostics")
+    _validate_artifact_paths(checkout, inputs, {
+        "events": events, "diagnostics": diagnostics, "stderr": stderr,
+    })
     if not os.environ.get("CSCS_INFERENCE_KEY"):
         raise ValueError("CSCS_INFERENCE_KEY is required")
     executable = shutil.which(engine)
@@ -290,9 +302,8 @@ def run_review(engine, image, checkout, context, events, instructions, config_di
             destination.chmod(0o444)
         name = f"opencode-review-{run_id}-reviewer"
         command = [
-            executable, "run", "--rm", "--name", name, "--pull=never", "--read-only",
+            executable, "run", "--rm", "--name", name, *BASELINE_FLAGS,
             "--label", proxy.label, "--network", proxy.network,
-            "--cap-drop=ALL", "--security-opt=no-new-privileges",
             "--user=1000:1000", "--workdir=/work",
             "--tmpfs=/work:rw,nosuid,nodev,mode=1777",
             "--tmpfs=/tmp:rw,nosuid,nodev,mode=1777",
@@ -322,7 +333,7 @@ def run_review(engine, image, checkout, context, events, instructions, config_di
                 os.fchmod(output.fileno(), 0o600)
                 os.fchmod(errors.fileno(), 0o600)
                 print(f"review runner: starting isolated reviewer; deadline={execution_seconds:g}s; "
-                      f"progress every {_PROGRESS_INTERVAL}s "
+                      f"progress every {_PROGRESS_REPORT_INTERVAL_SECONDS}s "
                       "(byte counts and fixed event/tool summaries only)", flush=True)
                 stopped = threading.Event()
                 reporter = threading.Thread(target=_report_progress,
@@ -392,6 +403,7 @@ def run_review(engine, image, checkout, context, events, instructions, config_di
 
 
 def main(argv=None):
+    """Parse trusted runner inputs and restore signal handling after execution or cancellation."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--engine", default="docker", help="Docker-compatible engine executable")
     parser.add_argument("--image", required=True)
@@ -404,6 +416,7 @@ def main(argv=None):
     args = parser.parse_args(argv)
 
     def interrupted(signum, frame):
+        """Translate termination into the normal interruption and resource-cleanup path."""
         raise KeyboardInterrupt
 
     previous_handler = signal.signal(signal.SIGTERM, interrupted)

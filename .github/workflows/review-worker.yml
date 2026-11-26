@@ -70,7 +70,7 @@ jobs:
       OPENCODE_REVIEW_IMAGE: ghcr.io/eth-cscs/cscs-oc-review/opencode-review@sha256:d7ab8d43c1b087097b7553cfbdf2732d5da03c87cd594c3ea148be9fcabc9911
       CREDENTIAL_PROXY_IMAGE: docker.io/library/caddy@sha256:4851e54a46b206517c574821bb5cc67f170d2156041e9fbc4c9193b45e84a75b
     outputs:
-      # Pass the API-validated PR number and reviewed SHA to finish, not model-supplied values.
+      # Pass the API-validated PR number and reviewed SHA to publish, not model-supplied values.
       pr_number: ${{ steps.prepare.outputs.pr_number }}
       head_sha: ${{ steps.prepare.outputs.head_sha }}
     steps:
@@ -98,11 +98,13 @@ jobs:
       # Fetch all review-history pages; fail on API errors.
       - name: Prepare validated PR metadata and review history
         id: prepare
+        # Module imports resolve from trusted source, not the consumer or PR checkout.
+        working-directory: reviewer-source
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          python3 reviewer-source/host/context.py prepare \
+          python3 -m host.context prepare \
             --event-name "$GITHUB_EVENT_NAME" \
             --event-path "$GITHUB_EVENT_PATH" \
             --repository "$GITHUB_REPOSITORY" \
@@ -124,11 +126,12 @@ jobs:
       # The merge-base comparison uses API-selected SHAs, not default-branch names.
       # Hooks, external diff drivers, and text converters are disabled by the helper.
       - name: Render review context without executing PR code
+        working-directory: reviewer-source
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          python3 reviewer-source/host/context.py render \
+          python3 -m host.context render \
             --metadata "$RUNNER_TEMP/opencode-review/input/metadata.json" \
             --checkout "$GITHUB_WORKSPACE/pr-source" \
             --output "$RUNNER_TEMP/opencode-review/input/context.md"
@@ -136,11 +139,12 @@ jobs:
       # Combine optional AGENTS.md with the discovered or explicitly selected review instructions.
       # Read only the consumer default branch; validate all files before creating the staged bundle.
       - name: Stage trusted project instructions
+        working-directory: reviewer-source
         env:
           REVIEW_INSTRUCTIONS_PATH: ${{ inputs.review-instructions-path }}
         run: |
           set -euo pipefail
-          python3 reviewer-source/host/context.py instructions \
+          python3 -m host.context instructions \
             --checkout "$GITHUB_WORKSPACE/repository-default" \
             --review-instructions-path="$REVIEW_INSTRUCTIONS_PATH" \
             --output "$RUNNER_TEMP/opencode-review/trusted/AGENTS.md"
@@ -185,11 +189,12 @@ jobs:
       # run.py snapshots inputs, enforces the deadline, and checks the source worktree after execution.
       - name: Run isolated CSCS reviewer
         id: reviewer
+        working-directory: reviewer-source
         env:
           CSCS_INFERENCE_KEY: ${{ secrets.CSCS_INFERENCE_KEY }}
         run: |
           set -euo pipefail
-          python3 reviewer-source/host/run.py \
+          python3 -m host.run \
             --engine docker \
             --image "$OPENCODE_REVIEW_IMAGE" \
             --proxy-image "$CREDENTIAL_PROXY_IMAGE" \
@@ -202,13 +207,14 @@ jobs:
       # Only a completed final response is publishable; inspection notes and reasoning are excluded.
       - name: Extract review text
         id: extract
+        working-directory: reviewer-source
         run: |
           set -euo pipefail
-          python3 reviewer-source/host/extract.py \
+          python3 -m host.extract \
             --events "$RUNNER_TEMP/opencode-review/model-output/events.jsonl" \
             --output "$RUNNER_TEMP/opencode-review/model-output/review.md"
 
-      # Upload only review.md for the finish job.
+      # Upload only review.md for the publish job.
       - name: Retain review text only
         uses: &upload_artifact_action actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -250,20 +256,17 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  # Publish text and update reactions with a comment-write token; no source checkout or inference key.
-  # Run after dependency failures, but not after cancellation or a skipped acknowledge job.
-  finish:
-    needs: [acknowledge, review]
-    if: ${{ always() && !cancelled() && needs.acknowledge.result != 'skipped' }}
+  # Publish only after a successful review; failed dependencies skip this job.
+  # Keep reaction maintenance separate so its failed-job retry cannot repeat publication.
+  publish:
+    needs: review
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
       pull-requests: write
     steps:
-      # Download final text only when review succeeded; otherwise continue to failure reporting.
+      # Transfer final text without checking out source or receiving the inference key.
       - name: Download review text
-        id: download
-        if: needs.review.result == 'success'
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: opencode-review
@@ -271,8 +274,6 @@ jobs:
 
       # Validate artifact text and trusted PR identity, then skip posting if the PR head has changed.
       - name: Publish only against the reviewed PR head
-        id: publish
-        if: needs.review.result == 'success'
         uses: *github_script_action
         env:
           REVIEW_PR_NUMBER: ${{ needs.review.outputs.pr_number }}
@@ -310,23 +311,27 @@ jobs:
             }
             await github.rest.issues.createComment({...context.repo, issue_number: pull_number, body});
 
-      # Include download/publication failures as well as failed dependencies.
-      # A successful retry removes only this token user's failure reactions on the request comment.
+  # Report acknowledgement, review, and publication failures without rerunning those jobs.
+  # A reaction-only failure can be retried independently of successful publication.
+  finish:
+    needs: [acknowledge, review, publish]
+    if: ${{ always() && !cancelled() && needs.acknowledge.result != 'skipped' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      pull-requests: write
+    steps:
+      # Clear only this token user's failure reactions after all preceding jobs succeed.
       # Cancellation leaves existing reactions unchanged.
       - name: Update request failure reaction
-        if: ${{ always() && !cancelled() }}
         uses: *github_script_action
         env:
           JOB_RESULTS: ${{ toJSON(needs.*.result) }}
-          STEP_RESULTS: ${{ toJSON(steps.*.outcome) }}
           REACTION_USER_ID: ${{ needs.acknowledge.outputs.reaction_user_id }}
         with:
           github-token: ${{ github.token }}
           script: |
-            const results = [
-              ...JSON.parse(process.env.JOB_RESULTS),
-              ...JSON.parse(process.env.STEP_RESULTS),
-            ];
+            const results = JSON.parse(process.env.JOB_RESULTS);
             const request = {...context.repo, comment_id: context.payload.comment.id};
             if (results.includes('failure')) {
               await github.rest.reactions.createForIssueComment({

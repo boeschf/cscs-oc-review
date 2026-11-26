@@ -8,11 +8,14 @@ import subprocess
 import time
 from urllib.parse import urlsplit
 
+from host.container_policy import BASELINE_FLAGS
+
 
 _PORT = 8080
 _ALIAS = "credential-proxy"
 _LABEL = "org.cscs.review.run"
-_CONTROL_TIMEOUT = 30
+# Per-command deadline, not a polling interval or a total cleanup budget.
+_CONTAINER_COMMAND_TIMEOUT_SECONDS = 30
 
 
 def load_policy(content):
@@ -45,6 +48,7 @@ def configuration(policy, token, key):
     upstream_host = authority if port == 443 else f"{authority}:{port}"
 
     def response(status):
+        """Build a fixed local rejection response without upstream access."""
         return {"handler": "static_response", "status_code": status}
 
     proxy = {
@@ -85,6 +89,7 @@ class CredentialProxy:
     """Own run-labelled containers and network; leave reviewer internet access unrestricted."""
 
     def __init__(self, engine, image, run_id, directory, policy, key, deadline):
+        """Bind run-scoped resources and credentials to the proxy startup deadline."""
         self.engine = engine
         self.image = image
         self.label = f"{_LABEL}={run_id}"
@@ -98,7 +103,9 @@ class CredentialProxy:
         self.deadline = deadline
 
     def _run(self, arguments, *, capture=False, cleanup=False):
-        timeout = _CONTROL_TIMEOUT if cleanup else min(_CONTROL_TIMEOUT, self.deadline - time.monotonic())
+        """Bound one engine command; cleanup retains a fresh deadline after startup expiry."""
+        timeout = (_CONTAINER_COMMAND_TIMEOUT_SECONDS if cleanup else
+                   min(_CONTAINER_COMMAND_TIMEOUT_SECONDS, self.deadline - time.monotonic()))
         if timeout <= 0:
             raise subprocess.TimeoutExpired(arguments, 0)
         return subprocess.run(
@@ -119,9 +126,8 @@ class CredentialProxy:
             os.chown(path, uid, gid)
         self._run(["network", "create", "--label", self.label, self.network])
         self._run([
-            "run", "--detach", "--name", self.name, "--pull=never",
+            "run", "--detach", "--name", self.name, *BASELINE_FLAGS,
             "--label", self.label, "--network", self.network, "--network-alias", _ALIAS,
-            "--read-only", "--cap-drop=ALL", "--security-opt=no-new-privileges",
             f"--user={uid}:{gid}", "--tmpfs=/tmp:rw,nosuid,nodev,mode=1777",
             "--env=XDG_CONFIG_HOME=/tmp/config", "--env=XDG_DATA_HOME=/tmp/data",
             "--volume", f"{path}:/etc/caddy/proxy.json:ro",

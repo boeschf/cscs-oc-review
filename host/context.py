@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Prepare authenticated PR metadata and render inert, untrusted review context."""
 
 import argparse
@@ -11,82 +10,48 @@ import stat
 import subprocess
 import urllib.error
 import urllib.parse
-import urllib.request
 
-if __package__:
-    from .history import fetch_history
-else:
-    from history import fetch_history
+from common.github import github_api
+from common.identifiers import require_id, require_sha
+from host.history import fetch_history
 
 
-SHA = re.compile(r"[0-9a-f]{40}\Z")
 REPOSITORY = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9_.-]+\Z")
 REVIEW_COMMAND = "/cscs-review"
 COMMAND = re.compile(re.escape(REVIEW_COMMAND) + r"(?:[ \t\r\n]|$)", re.IGNORECASE | re.ASCII)
 
 
 def repository(value):
+    """Validate the owner/name identifier before building API or fetch paths."""
     if not isinstance(value, str) or not REPOSITORY.fullmatch(value) or value.split("/")[1] in {".", ".."}:
         raise ValueError("invalid GitHub repository")
     return value
 
 
-def sha(value):
-    if not isinstance(value, str) or not SHA.fullmatch(value):
-        raise ValueError("invalid commit SHA")
-    return value
-
-
-def number(value):
-    if type(value) is not int or value <= 0:
-        raise ValueError("invalid pull request number")
-    return value
-
-
 def text(value, field):
+    """Require a string while keeping untrusted display text inert."""
     if not isinstance(value, str):
         raise ValueError(f"invalid {field}")
     return value
 
 
 def mapping(value):
+    """Require a JSON object before accessing its fields."""
     if not isinstance(value, dict):
         raise ValueError("expected a JSON object")
     return value
 
 
 def human(user):
+    """Return a normalized human login, rejecting bot and malformed actors."""
     if (not isinstance(user, dict) or user.get("type") != "User"
             or not isinstance(user.get("login"), str) or user["login"].lower().endswith("[bot]")):
         raise ValueError("bot or invalid actor is not allowed")
     return user["login"].lower()
 
 
-class NoRedirect(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        raise ValueError("GitHub API redirects are not allowed")
-
-
-def github_api(path, payload=None):
-    token = os.environ.get("GH_TOKEN")
-    if not token:
-        raise ValueError("GH_TOKEN is required")
-    if not path.startswith("/") or path.startswith("//"):
-        raise ValueError("invalid GitHub API path")
-    request = urllib.request.Request(
-        "https://api.github.com" + path,
-        headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json",
-                 "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "opencode-review-context"},
-        data=None if payload is None else json.dumps(payload).encode("utf-8"),
-        method="GET" if payload is None else "POST",
-    )
-    if payload is not None:
-        request.add_header("Content-Type", "application/json")
-    with urllib.request.build_opener(NoRedirect()).open(request, timeout=60) as response:
-        return json.load(response)
-
-
 def has_write_permission(repo, actor, api=None):
+    """Check effective repository write access; a missing collaborator has none."""
     if api is None:
         api = github_api
     try:
@@ -113,7 +78,7 @@ def review_request(event_name, event, repo):
     issue = mapping(event.get("issue"))
     if not isinstance(issue.get("pull_request"), dict):
         raise ValueError("review command must target a pull request")
-    pr_number = number(issue.get("number"))
+    pr_number = require_id(issue.get("number"), field="pull request number")
     comment = mapping(event.get("comment"))
     if human(comment.get("user")) != actor:
         raise ValueError("review command actor is not authorized")
@@ -152,12 +117,13 @@ def prepare(event_name, event, repo, api=None):
 
 
 def validate_metadata(metadata):
+    """Validate trusted metadata fields before consuming identifiers or display data."""
     if not isinstance(metadata, dict) or metadata.get("schema_version") != 1:
         raise ValueError("unsupported metadata schema")
     repo = repository(metadata.get("repository"))
-    number(metadata.get("pr_number"))
+    require_id(metadata.get("pr_number"), field="pull request number")
     for side in ("head", "base"):
-        sha(metadata.get(side + "_sha"))
+        require_sha(metadata.get(side + "_sha"), field="commit SHA")
         repository(metadata.get(side + "_repository"))
         # Branch names are display data; Git operations use the validated SHAs.
         text(metadata.get(side + "_ref"), side + " ref")
@@ -173,6 +139,7 @@ def validate_metadata(metadata):
 
 
 def git(checkout, *args, auth=None):
+    """Run Git without inherited credentials, hooks, helpers, or mutable global state."""
     # Ignore inherited Git state and tokens; fetch authentication is supplied explicitly.
     environment = {
         key: value for key, value in os.environ.items()
@@ -196,6 +163,7 @@ def git(checkout, *args, auth=None):
 
 
 def worktree_root(checkout):
+    """Resolve and require the exact Git worktree root, not a nested directory."""
     checkout = Path(checkout).resolve(strict=True)
     root = Path(git(checkout, "rev-parse", "--show-toplevel").strip()).resolve()
     if root != checkout:
@@ -280,6 +248,7 @@ def stage_instructions(checkout, output, *, review_instructions_path=""):
 
 
 def render(metadata, checkout):
+    """Render validated metadata, inert history, and the committed merge-base diff."""
     validate_metadata(metadata)
     checkout = worktree_root(checkout)
     if git(checkout, "rev-parse", "--verify", "HEAD").strip() != metadata["head_sha"]:
@@ -294,7 +263,7 @@ def render(metadata, checkout):
         git(checkout, "fetch", "--no-tags", "--no-write-fetch-head", "--no-recurse-submodules",
             "--", "https://github.com/" + metadata["base_repository"] + ".git", base, auth=token)
     merge_base = git(checkout, "merge-base", base, metadata["head_sha"]).strip()
-    sha(merge_base)
+    require_sha(merge_base, field="commit SHA")
     diff = git(checkout, "diff", "--no-ext-diff", "--no-textconv", "--no-color", "--no-renames",
                "--full-index", "--binary", merge_base, metadata["head_sha"], "--")
     review_history = metadata["review_history"]
@@ -310,6 +279,7 @@ def render(metadata, checkout):
 
 
 def main(argv=None):
+    """Dispatch authorization, context preparation, rendering, or instruction staging."""
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
     for command in ("authorize", "prepare"):

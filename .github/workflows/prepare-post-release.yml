@@ -57,6 +57,6 @@ jobs:
           RELEASE_ID: ${{ github.event.release.id }}
         run: |
           set -euo pipefail
-          uv run --with pyyaml python tools/post_release.py \
+          uv run --with pyyaml python -m tools.post_release \
             --repository "$GITHUB_REPOSITORY" \
             --release-id "$RELEASE_ID" | tee -a "$GITHUB_STEP_SUMMARY"
